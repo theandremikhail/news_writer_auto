@@ -1,0 +1,760 @@
+import streamlit as st
+import feedparser
+import requests
+from bs4 import BeautifulSoup
+import anthropic
+import datetime
+import hashlib
+import time
+import re
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse, urljoin
+import sqlite3
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from io import BytesIO
+from PIL import Image
+
+# ============= CONFIGURATION =============
+class ClickMovementConfig:
+    WORDPRESS_SITES = {
+        "american_conservatives": {
+            "name": "American Conservatives",
+            "wp_url": "https://americanconservatives.com",
+            "username": st.secrets.get("ac_username", ""),
+            "password": st.secrets.get("ac_password", ""),
+            "writer_style": "Ben Shapiro",
+            "style_description": "Fast-paced, fact-driven with sharp logical reasoning",
+            "themes": ["conservative", "politics", "freedom", "economy", "breaking"],
+            "target_audience": "Conservative Americans"
+        },
+        "americans_digest": {
+            "name": "The American's Digest",
+            "wp_url": "https://theamericansdigest.com",
+            "username": st.secrets.get("ad_username", ""),
+            "password": st.secrets.get("ad_password", ""),
+            "writer_style": "Walter Cronkite",
+            "style_description": "Authoritative, measured, and trustworthy delivery",
+            "themes": ["national", "politics", "economy", "culture", "top"],
+            "target_audience": "Mainstream conservatives"
+        },
+        "conservatives_daily": {
+            "name": "Conservatives Daily",
+            "wp_url": "https://conservativesdaily.com",
+            "username": st.secrets.get("cd_username", ""),
+            "password": st.secrets.get("cd_password", ""),
+            "writer_style": "Dan Rather",
+            "style_description": "Folksy yet authoritative, with investigative edge",
+            "themes": ["breaking", "daily", "conservative", "america", "trending"],
+            "target_audience": "Daily conservative readers"
+        },
+        "world_reports": {
+            "name": "World Reports",
+            "wp_url": "https://worldlyreports.com",
+            "username": st.secrets.get("wr_username", ""),
+            "password": st.secrets.get("wr_password", ""),
+            "writer_style": "Walter Cronkite",
+            "style_description": "Global perspective with American viewpoint",
+            "themes": ["world", "international", "global", "foreign", "breaking"],
+            "target_audience": "Internationally-aware conservatives"
+        }
+    }
+    
+    NEWS_SOURCES = {
+        "breaking": [
+            {"name": "Reuters", "rss": "https://feeds.reuters.com/reuters/topNews", "weight": 5},
+            {"name": "AP Breaking", "rss": "https://feeds.apnews.com/rss/apf-topnews", "weight": 5},
+            {"name": "CNN Breaking", "rss": "http://rss.cnn.com/rss/cnn_latest.rss", "weight": 5},
+            {"name": "BBC Breaking", "rss": "http://feeds.bbci.co.uk/news/world/rss.xml", "weight": 5},
+        ],
+        "conservative": [
+            {"name": "Newsmax", "rss": "https://www.newsmax.com/rss/Newsfront/16/", "weight": 4},
+            {"name": "Fox News", "rss": "http://feeds.foxnews.com/foxnews/latest", "weight": 4},
+            {"name": "Fox Politics", "rss": "http://feeds.foxnews.com/foxnews/politics", "weight": 4},
+            {"name": "Daily Wire", "rss": "https://www.dailywire.com/feeds/rss.xml", "weight": 3},
+            {"name": "Breitbart", "rss": "https://feeds.feedburner.com/breitbart", "weight": 3},
+            {"name": "PJ Media", "rss": "https://pjmedia.com/feed", "weight": 3},
+            {"name": "Federalist", "rss": "https://thefederalist.com/feed/", "weight": 3},
+            {"name": "RedState", "rss": "https://redstate.com/feed", "weight": 2},
+            {"name": "Townhall", "rss": "https://townhall.com/rss", "weight": 2},
+            {"name": "Daily Caller", "rss": "https://dailycaller.com/feed/", "weight": 2},
+        ],
+        "mainstream": [
+            {"name": "Reuters", "rss": "https://feeds.reuters.com/reuters/topNews", "weight": 5},
+            {"name": "AP News", "rss": "https://feeds.apnews.com/rss/apf-topnews", "weight": 5},
+            {"name": "CBS", "rss": "https://www.cbsnews.com/latest/rss/main", "weight": 4},
+            {"name": "NBC", "rss": "https://feeds.nbcnews.com/nbcnews/public/news", "weight": 4},
+            {"name": "ABC News", "rss": "https://feeds.abcnews.com/abcnews/topstories", "weight": 4},
+            {"name": "USA Today", "rss": "http://rssfeeds.usatoday.com/usatoday-NewsTopStories", "weight": 3},
+        ],
+        "world": [
+            {"name": "BBC World", "rss": "http://feeds.bbci.co.uk/news/world/rss.xml", "weight": 5},
+            {"name": "Guardian World", "rss": "https://www.theguardian.com/world/rss", "weight": 4},
+            {"name": "Reuters World", "rss": "https://feeds.reuters.com/Reuters/worldNews", "weight": 5},
+        ],
+        "politics": [
+            {"name": "Politico", "rss": "https://www.politico.com/rss/politicopicks.xml", "weight": 4},
+            {"name": "The Hill", "rss": "https://thehill.com/feed/", "weight": 4},
+        ]
+    }
+    
+    MIN_WORDS = 400
+    MAX_WORDS = 800
+    ARTICLES_PER_SITE = 10
+    ANTHROPIC_KEY = st.secrets.get("anthropic_key", "")
+
+# ============= DATABASE =============
+class ArticleDatabase:
+    def __init__(self):
+        self.conn = sqlite3.connect('news_articles.db', check_same_thread=False)
+        self.create_tables()
+    
+    def create_tables(self):
+        self.conn.execute('''
+            CREATE TABLE IF NOT EXISTS processed_articles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                article_hash TEXT UNIQUE,
+                title TEXT,
+                source TEXT,
+                site TEXT,
+                processed_at TIMESTAMP,
+                published BOOLEAN DEFAULT 0
+            )
+        ''')
+        self.conn.commit()
+    
+    def is_duplicate(self, title: str, site: str, hours: int = 48) -> bool:
+        article_hash = hashlib.md5(f"{title}_{site}".encode()).hexdigest()
+        cutoff = datetime.now() - timedelta(hours=hours)
+        cursor = self.conn.execute(
+            'SELECT 1 FROM processed_articles WHERE article_hash = ? AND processed_at > ?',
+            (article_hash, cutoff)
+        )
+        return cursor.fetchone() is not None
+    
+    def add_processed(self, title: str, source: str, site: str):
+        article_hash = hashlib.md5(f"{title}_{site}".encode()).hexdigest()
+        try:
+            self.conn.execute(
+                'INSERT INTO processed_articles (article_hash, title, source, site, processed_at) VALUES (?, ?, ?, ?, ?)',
+                (article_hash, title, source, site, datetime.now())
+            )
+            self.conn.commit()
+        except:
+            pass
+
+# ============= NEWS FETCHER =============
+class NewsFetcher:
+    def fetch_articles(self, themes: List[str]) -> List[Dict]:
+        all_articles = []
+        categories = self._get_categories(themes)
+        
+        for category in categories:
+            for source in ClickMovementConfig.NEWS_SOURCES.get(category, []):
+                try:
+                    feed = feedparser.parse(source['rss'])
+                    for entry in feed.entries[:15]:
+                        all_articles.append({
+                            'title': entry.get('title', ''),
+                            'link': entry.get('link', ''),
+                            'summary': entry.get('summary', ''),
+                            'source': source['name'],
+                            'score': self._score(entry, themes, source['weight'])
+                        })
+                except:
+                    continue
+        
+        all_articles.sort(key=lambda x: x['score'], reverse=True)
+        return all_articles[:50]
+    
+    def _get_categories(self, themes):
+        cats = set()
+        for theme in themes:
+            if theme in ["conservative", "freedom", "america"]:
+                cats.add("conservative")
+            if theme in ["breaking", "daily", "trending"]:
+                cats.add("breaking")
+            if theme in ["politics", "economy"]:
+                cats.update(["politics", "mainstream"])
+            if theme in ["world", "international", "global", "foreign"]:
+                cats.add("world")
+            if theme in ["national", "top", "culture"]:
+                cats.add("mainstream")
+        return cats or {"breaking", "mainstream", "conservative"}
+    
+    def _score(self, entry, themes, weight):
+        score = weight * 10
+        text = f"{entry.get('title', '')} {entry.get('summary', '')}".lower()
+        for theme in themes:
+            if theme.lower() in text:
+                score += 25
+        return score
+
+# ============= CONTENT PROCESSOR =============
+class ContentProcessor:
+    def __init__(self):
+        self.client = anthropic.Anthropic(api_key=ClickMovementConfig.ANTHROPIC_KEY) if ClickMovementConfig.ANTHROPIC_KEY else None
+    
+    def scrape_article(self, url: str) -> str:
+        try:
+            response = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            for element in soup(['script', 'style', 'nav', 'header', 'footer']):
+                element.decompose()
+            
+            selectors = ['article', '.article-body', '.entry-content', '.post-content', 'main']
+            for selector in selectors:
+                elements = soup.select(selector)
+                if elements:
+                    paragraphs = elements[0].find_all(['p'])
+                    text = ' '.join([p.get_text(strip=True) for p in paragraphs])
+                    if len(text) > 500:
+                        return self._deep_clean(text)
+            
+            paragraphs = soup.find_all('p')
+            text = ' '.join([p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 50])
+            return self._deep_clean(text)
+        except:
+            return ""
+    
+    def _deep_clean(self, text: str) -> str:
+        if not text:
+            return ""
+        
+        junk_patterns = [
+            r'[A-Z][a-z]+\s+[A-Z][a-z]+\s+is\s+a\s+(?:reporter|writer|correspondent).*',
+            r'Story tips can be sent to.*',
+            r'CLICK HERE TO.*',
+            r'Subscribe.*newsletter.*',
+            r'Follow.*on.*',
+            r'@[\w]+',
+            r'©\s*\d{4}.*',
+            r'All [Rr]ights [Rr]eserved',
+        ]
+        
+        for pattern in junk_patterns:
+            text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+        
+        sources = ['Fox News', 'CNN', 'MSNBC', 'Reuters', 'AP', 'BBC']
+        for source in sources:
+            text = re.sub(rf'\b{source}\b', '', text, flags=re.IGNORECASE)
+        
+        lines = []
+        for line in text.split('\n'):
+            line = line.strip()
+            if not line or len(line) < 20:
+                continue
+            if any(x in line.lower() for x in ['click here', 'subscribe', 'follow', 'contact']):
+                continue
+            lines.append(line)
+        
+        return ' '.join(lines).strip()
+    
+    def rewrite_article(self, content: str, site_config: Dict) -> Tuple[str, List[str]]:
+        if not self.client or not content:
+            return "", []
+        
+        prompt = f"""Rewrite this news article following the TONE and PERSPECTIVE of {site_config['writer_style']}.
+
+CRITICAL RULES:
+- NO author bios or bylines
+- NO source names (Fox News, CNN, etc)
+- NO subscription text
+- NO "click here" or navigation
+- NO social media handles
+- NO copyright notices
+- Write as {site_config['name']} original reporting
+- Use PROPER GRAMMAR throughout (no mimicking speaking patterns)
+- Follow the TONE: {site_config['style_description']}
+- Maintain journalistic professionalism
+
+TONE GUIDELINES:
+- Ben Shapiro tone: Fast-paced, fact-driven, sharp logical reasoning (but proper grammar)
+- Walter Cronkite tone: Authoritative, measured, trustworthy delivery (but proper grammar)
+- Dan Rather tone: Folksy yet authoritative, investigative edge (but proper grammar)
+
+Target Audience: {site_config['target_audience']}
+Length: {ClickMovementConfig.MIN_WORDS}-{ClickMovementConfig.MAX_WORDS} words
+
+Article to rewrite:
+{content[:3000]}
+
+Generate 3 headline options and the rewritten article.
+
+HEADLINE REQUIREMENTS:
+- Write natural, straightforward headlines
+- NO colons or "Title: Subtitle" format
+- NO "EXCLUSIVE:" or "BREAKING:" prefixes
+- Just clear, direct headlines
+- Example: "Trump Administration Announces New Education Policy"
+- NOT: "Education Reform: Trump Administration Takes Bold Action"
+
+Format:
+HEADLINES:
+1. [headline]
+2. [headline]  
+3. [headline]
+
+ARTICLE:
+[rewritten content]
+"""
+        
+        try:
+            response = self.client.messages.create(
+                model="claude-3-5-sonnet-20241022",
+                max_tokens=3000,
+                temperature=0.7,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            
+            text = response.content[0].text
+            
+            headlines = []
+            article = ""
+            
+            if "HEADLINES:" in text and "ARTICLE:" in text:
+                parts = text.split("ARTICLE:")
+                headline_section = parts[0].replace("HEADLINES:", "").strip()
+                article = parts[1].strip()
+                
+                for line in headline_section.split('\n'):
+                    line = re.sub(r'^\d+\.\s*', '', line).strip()
+                    line = line.strip('"').strip("'")
+                    if line and len(line) > 10:
+                        headlines.append(line)
+            
+            return article, headlines[:3]
+        except Exception as e:
+            st.error(f"Rewrite error: {str(e)}")
+            return "", []
+
+# ============= IMAGE FETCHER =============
+class ImageFetcher:
+    def fetch_images(self, url: str) -> List[str]:
+        try:
+            response = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            images = []
+            
+            for tag in soup.find_all('meta', property='og:image'):
+                img_url = tag.get('content')
+                if img_url and self._is_valid_image(img_url):
+                    images.append(urljoin(url, img_url))
+            
+            for tag in soup.find_all('meta', attrs={'name': 'twitter:image'}):
+                img_url = tag.get('content')
+                if img_url and self._is_valid_image(img_url):
+                    images.append(urljoin(url, img_url))
+            
+            for img in soup.select('article img, .article-body img, .entry-content img')[:8]:
+                src = img.get('data-src') or img.get('src')
+                if src and self._is_valid_image(src):
+                    images.append(urljoin(url, src))
+            
+            seen = set()
+            unique_images = []
+            for img in images:
+                if img not in seen:
+                    seen.add(img)
+                    unique_images.append(img)
+            
+            return unique_images[:5]
+        except Exception as e:
+            return []
+    
+    def _is_valid_image(self, url: str) -> bool:
+        if not url:
+            return False
+        url_lower = url.lower()
+        invalid_terms = ['logo', 'icon', 'avatar', 'profile', 'badge', 'pixel', '1x1', 'tracking']
+        if any(term in url_lower for term in invalid_terms):
+            return False
+        valid_extensions = ['.jpg', '.jpeg', '.png', '.webp']
+        return any(ext in url_lower for ext in valid_extensions) or 'image' in url_lower
+
+# ============= WORDPRESS PUBLISHER =============
+class WordPressPublisher:
+    def __init__(self):
+        self.sessions = {}
+    
+    def _get_session(self, site_config: Dict) -> requests.Session:
+        """Get or create a session for this site"""
+        site_key = site_config['name']
+        
+        if site_key not in self.sessions:
+            session = requests.Session()
+            session.auth = (site_config['username'], site_config['password'])
+            session.headers.update({
+                'Content-Type': 'application/json',
+                'User-Agent': 'WordPress-Python-Client/1.0',
+                'Accept': 'application/json'
+            })
+            self.sessions[site_key] = session
+        
+        return self.sessions[site_key]
+    
+    def test_connection(self, site_config: Dict) -> Dict:
+        """Test if WordPress REST API is accessible"""
+        try:
+            session = self._get_session(site_config)
+            api_url = f"{site_config['wp_url']}/wp-json/wp/v2/users/me"
+            
+            response = session.get(api_url, timeout=10)
+            
+            if response.status_code == 200:
+                user_data = response.json()
+                return {
+                    'success': True,
+                    'message': f'Connected as {user_data.get("name", "Unknown")}',
+                    'user': user_data
+                }
+            elif response.status_code == 401:
+                return {
+                    'success': False,
+                    'error': 'Authentication failed. Check username/password or create Application Password in WordPress Users > Profile.'
+                }
+            elif response.status_code == 403:
+                return {
+                    'success': False,
+                    'error': 'REST API is blocked. Check security plugins (Wordfence, iThemes) or server firewall.'
+                }
+            else:
+                return {
+                    'success': False,
+                    'error': f'Status {response.status_code}: {response.text[:200]}'
+                }
+                
+        except Exception as e:
+            return {'success': False, 'error': f'Connection error: {str(e)}'}
+    
+    def publish(self, site_config: Dict, title: str, content: str, status: str = 'draft') -> Dict:
+        try:
+            session = self._get_session(site_config)
+            api_url = f"{site_config['wp_url']}/wp-json/wp/v2/posts"
+            
+            # Clean content - remove duplicate H1 tags
+            content_cleaned = re.sub(r'<h1>.*?</h1>', '', content, flags=re.IGNORECASE)
+            
+            # Ensure proper paragraph formatting
+            if '<p>' not in content_cleaned:
+                paragraphs = [p.strip() for p in content_cleaned.split('\n\n') if p.strip()]
+                content_cleaned = ''.join(f'<p>{p}</p>' for p in paragraphs)
+            
+            # Remove empty paragraphs
+            content_cleaned = re.sub(r'<p>\s*</p>', '', content_cleaned)
+            
+            payload = {
+                'title': title,
+                'content': content_cleaned,
+                'status': status
+            }
+            
+            response = session.post(api_url, json=payload, timeout=30)
+            
+            if response.status_code == 201:
+                post_id = response.json()['id']
+                return {
+                    'success': True,
+                    'post_id': post_id,
+                    'edit_url': f"{site_config['wp_url']}/wp-admin/post.php?post={post_id}&action=edit"
+                }
+            elif response.status_code == 401:
+                return {
+                    'success': False,
+                    'error': 'Authentication failed. Check your Application Password in WordPress Users > Profile.'
+                }
+            elif response.status_code == 403:
+                return {
+                    'success': False,
+                    'error': 'Access forbidden. Possible causes: REST API disabled, security plugin blocking, or insufficient user permissions.'
+                }
+            elif response.status_code == 400:
+                error_data = response.json()
+                return {
+                    'success': False,
+                    'error': f'Invalid parameters: {error_data.get("message", "WordPress rejected the post content")}'
+                }
+            else:
+                return {
+                    'success': False,
+                    'error': f'Status {response.status_code}: {response.text[:500]}'
+                }
+        except Exception as e:
+            return {'success': False, 'error': f'Error: {str(e)}'}
+
+# ============= MAIN PROCESSOR =============
+class NewsProcessor:
+    def __init__(self):
+        self.db = ArticleDatabase()
+        self.fetcher = NewsFetcher()
+        self.processor = ContentProcessor()
+        self.images = ImageFetcher()
+        self.publisher = WordPressPublisher()
+    
+    def process_site(self, site_key: str, site_config: Dict) -> List[Dict]:
+        processed = []
+        
+        articles = self.fetcher.fetch_articles(site_config['themes'])
+        
+        for article in articles:
+            if len(processed) >= ClickMovementConfig.ARTICLES_PER_SITE:
+                break
+            
+            if self.db.is_duplicate(article['title'], site_key):
+                continue
+            
+            full_content = self.processor.scrape_article(article['link'])
+            if not full_content or len(full_content.split()) < 200:
+                continue
+            
+            rewritten, headlines = self.processor.rewrite_article(full_content, site_config)
+            if not rewritten or len(rewritten.split()) < ClickMovementConfig.MIN_WORDS:
+                continue
+            
+            image_urls = self.images.fetch_images(article['link'])
+            
+            processed.append({
+                'original_title': article['title'],
+                'headlines': headlines if headlines else [article['title']],
+                'selected_headline': headlines[0] if headlines else article['title'],
+                'content': rewritten,
+                'source': article['source'],
+                'url': article['link'],
+                'images': image_urls,
+                'selected_image': image_urls[0] if image_urls else None,
+                'word_count': len(rewritten.split()),
+                'site_config': site_config
+            })
+            
+            self.db.add_processed(article['title'], article['source'], site_key)
+        
+        return processed
+
+# ============= STREAMLIT UI =============
+st.set_page_config(page_title="News Intelligence Dashboard", layout="wide")
+
+if 'processed_articles' not in st.session_state:
+    st.session_state.processed_articles = {}
+if 'published' not in st.session_state:
+    st.session_state.published = set()
+
+st.markdown("""
+<style>
+    .header {
+        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+        padding: 2rem;
+        border-radius: 10px;
+        margin-bottom: 2rem;
+    }
+    .header h1 {
+        color: white;
+        margin: 0;
+        font-size: 2.5rem;
+        font-weight: 300;
+    }
+    .article-card {
+        background: white;
+        border: 1px solid #e0e0e0;
+        border-radius: 8px;
+        padding: 2rem;
+        margin: 1.5rem 0;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .stat-box {
+        background: #f5f5f5;
+        padding: 1rem;
+        border-radius: 6px;
+        text-align: center;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown('<div class="header"><h1>News Intelligence Dashboard</h1></div>', unsafe_allow_html=True)
+
+with st.expander("🔧 Troubleshooting WordPress 403 Errors"):
+    st.markdown("""
+    **If you get 403 Forbidden errors when publishing:**
+    
+    1. **Enable Application Passwords** (Required for REST API):
+       - Go to WordPress Admin → Users → Your Profile
+       - Scroll to "Application Passwords" section
+       - Create new password with name "NewsIntelligence"
+       - Copy the generated password (spaces included)
+       - Update the password in your secrets
+    
+    2. **Check REST API Access**:
+       - Visit: `https://yoursite.com/wp-json/wp/v2/posts`
+       - Should show JSON data, not a 403 error
+    
+    3. **Disable Security Plugin Blocking** (if using Wordfence, iThemes, etc.):
+       - Wordfence: Go to Firewall → Manage Rate Limiting → Whitelist REST API
+       - iThemes Security: Go to Settings → Allow REST API
+       - All In One WP Security: Disable "Completely Block Access To REST API"
+    
+    4. **Check User Permissions**:
+       - Your WordPress user must have "Editor" or "Administrator" role
+       - Verify in Users → All Users
+    
+    5. **Contact Host** if issue persists:
+       - Some hosts block REST API at server level
+       - Ask them to whitelist: `/wp-json/wp/v2/posts`
+    
+    Click **"Test Connections"** button below to diagnose the issue.
+    """)
+
+col1, col2, col3 = st.columns([2, 1.5, 1])
+
+with col1:
+    if st.button("Fetch & Process Articles", type="primary", use_container_width=True):
+        processor = NewsProcessor()
+        results = {}
+        
+        progress = st.progress(0)
+        sites = list(ClickMovementConfig.WORDPRESS_SITES.items())
+        
+        for idx, (site_key, site_config) in enumerate(sites):
+            with st.spinner(f"Processing {site_config['name']}..."):
+                processed = processor.process_site(site_key, site_config)
+                results[site_key] = processed
+                st.info(f"✓ {site_config['name']}: Found {len(processed)} articles")
+                progress.progress((idx + 1) / len(sites))
+        
+        st.session_state.processed_articles = results
+        total = sum(len(articles) for articles in results.values())
+        st.success(f"Processed {total} articles!")
+        st.rerun()
+
+with col2:
+    if st.button("Test Connections", use_container_width=True):
+        publisher = WordPressPublisher()
+        for site_key, site_config in ClickMovementConfig.WORDPRESS_SITES.items():
+            result = publisher.test_connection(site_config)
+            if result['success']:
+                st.success(f"✅ {site_config['name']}: {result['message']}")
+            else:
+                st.error(f"❌ {site_config['name']}: {result['error']}")
+
+with col3:
+    if st.button("Clear All", use_container_width=True):
+        st.session_state.processed_articles = {}
+        st.session_state.published = set()
+        st.rerun()
+
+if st.session_state.processed_articles:
+    total = sum(len(a) for a in st.session_state.processed_articles.values())
+    published = len(st.session_state.published)
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.markdown(f'<div class="stat-box"><h2>{total}</h2><p>Total Articles</p></div>', unsafe_allow_html=True)
+    with col2:
+        st.markdown(f'<div class="stat-box"><h2>{published}</h2><p>Published</p></div>', unsafe_allow_html=True)
+    with col3:
+        st.markdown(f'<div class="stat-box"><h2>{total-published}</h2><p>Ready</p></div>', unsafe_allow_html=True)
+
+if st.session_state.processed_articles:
+    for site_key, articles in st.session_state.processed_articles.items():
+        if not articles:
+            continue
+        
+        site_config = ClickMovementConfig.WORDPRESS_SITES[site_key]
+        st.markdown(f"### {site_config['name']}")
+        
+        for idx, article in enumerate(articles):
+            article_id = f"{site_key}_{idx}"
+            
+            with st.container():
+                st.markdown('<div class="article-card">', unsafe_allow_html=True)
+                
+                selected_headline = st.selectbox(
+                    "Select Headline",
+                    article['headlines'],
+                    key=f"headline_{article_id}"
+                )
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.caption(f"Source: {article['source']}")
+                with col2:
+                    st.caption(f"Words: {article['word_count']}")
+                with col3:
+                    if article_id in st.session_state.published:
+                        st.caption("Status: PUBLISHED")
+                
+                if article['images']:
+                    st.write("**Images:**")
+                    img_cols = st.columns(min(3, len(article['images'])))
+                    for img_idx, img_url in enumerate(article['images'][:3]):
+                        with img_cols[img_idx]:
+                            try:
+                                response = requests.get(img_url, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
+                                img = Image.open(BytesIO(response.content))
+                                st.image(img, use_container_width=True)
+                                st.caption(f"[Link]({img_url})")
+                            except Exception as e:
+                                st.warning(f"⚠️ Image failed to load")
+                                st.caption(f"[View Image]({img_url})")
+                
+                with st.expander("Read Article"):
+                    st.write(article['content'])
+                
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    if st.button("Publish Draft", key=f"draft_{article_id}", 
+                               disabled=article_id in st.session_state.published,
+                               use_container_width=True):
+                        publisher = WordPressPublisher()
+                        result = publisher.publish(
+                            site_config,
+                            selected_headline,
+                            article['content'],
+                            'draft'
+                        )
+                        if result['success']:
+                            st.success(f"Draft created! [Edit]({result['edit_url']})")
+                            st.session_state.published.add(article_id)
+                            st.rerun()
+                        else:
+                            st.error(f"Failed: {result['error']}")
+                
+                with col2:
+                    if st.button("Publish Live", key=f"live_{article_id}", 
+                               disabled=article_id in st.session_state.published,
+                               type="primary",
+                               use_container_width=True):
+                        publisher = WordPressPublisher()
+                        result = publisher.publish(
+                            site_config,
+                            selected_headline,
+                            article['content'],
+                            'publish'
+                        )
+                        if result['success']:
+                            st.success(f"Published! [View]({result['edit_url']})")
+                            st.session_state.published.add(article_id)
+                            st.rerun()
+                        else:
+                            st.error(f"Failed: {result['error']}")
+                
+                with col3:
+                    if st.button("Regenerate Headline", key=f"regen_{article_id}",
+                               use_container_width=True):
+                        processor = ContentProcessor()
+                        _, new_headlines = processor.rewrite_article(
+                            article['content'][:1000],
+                            site_config
+                        )
+                        if new_headlines:
+                            st.session_state.processed_articles[site_key][idx]['headlines'] = new_headlines
+                            st.rerun()
+                
+                with col4:
+                    st.link_button("Source", article['url'], use_container_width=True)
+                
+                st.markdown('</div>', unsafe_allow_html=True)
+
+else:
+    st.info("Click 'Fetch & Process Articles' to begin")

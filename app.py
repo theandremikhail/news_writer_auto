@@ -836,6 +836,21 @@ if st.session_state.processed_articles:
                     key=f"headline_{article_id}"
                 )
                 
+                # Image selection
+                selected_image = None
+                if article['images']:
+                    image_options = ["No Featured Image"] + [f"Image {i+1}" for i in range(len(article['images']))]
+                    selected_image_idx = st.selectbox(
+                        "Select Featured Image",
+                        range(len(image_options)),
+                        format_func=lambda x: image_options[x],
+                        key=f"image_{article_id}",
+                        index=1 if article['images'] else 0  # Default to first image
+                    )
+                    if selected_image_idx > 0:
+                        selected_image = article['images'][selected_image_idx - 1]
+                        st.caption(f"✓ Will use: {image_options[selected_image_idx]}")
+                
                 col1, col2, col3 = st.columns(3)
                 with col1:
                     st.caption(f"Source: {article['source']}")
@@ -851,7 +866,7 @@ if st.session_state.processed_articles:
                     st.caption(", ".join(article['tags']))
                 
                 if article['images']:
-                    st.write("**Images:**")
+                    st.write("**Available Images:**")
                     img_cols = st.columns(min(3, len(article['images'])))
                     for img_idx, img_url in enumerate(article['images'][:3]):
                         with img_cols[img_idx]:
@@ -859,9 +874,14 @@ if st.session_state.processed_articles:
                                 response = requests.get(img_url, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
                                 img = Image.open(BytesIO(response.content))
                                 st.image(img, use_container_width=True)
+                                # Highlight selected image
+                                if selected_image and img_url == selected_image:
+                                    st.caption(f"**Image {img_idx+1}** ⭐ Selected")
+                                else:
+                                    st.caption(f"Image {img_idx+1}")
                                 st.caption(f"[Link]({img_url})")
                             except Exception as e:
-                                st.warning(f"⚠️ Image failed to load")
+                                st.warning(f"⚠️ Image {img_idx+1} failed to load")
                                 st.caption(f"[View Image]({img_url})")
                 
                 with st.expander("Read Article"):
@@ -879,7 +899,7 @@ if st.session_state.processed_articles:
                             selected_headline,
                             article['content'],
                             'draft',
-                            image_url=article.get('selected_image'),
+                            image_url=selected_image,
                             tags=article.get('tags', [])
                         )
                         if result['success']:
@@ -905,7 +925,7 @@ if st.session_state.processed_articles:
                             selected_headline,
                             article['content'],
                             'publish',
-                            image_url=article.get('selected_image'),
+                            image_url=selected_image,
                             tags=article.get('tags', [])
                         )
                         if result['success']:

@@ -35,7 +35,7 @@ class ClickMovementConfig:
             "password": st.secrets.get("ad_password", ""),
             "writer_style": "Walter Cronkite",
             "style_description": "Authoritative, measured, and trustworthy delivery",
-            "themes": ["national", "politics", "economy", "culture", "top"],
+            "themes": ["national", "politics", "economy", "culture", "conservative", "breaking"],
             "target_audience": "Mainstream conservatives"
         },
         "conservatives_daily": {
@@ -429,7 +429,8 @@ class WordPressPublisher:
         except Exception as e:
             return {'success': False, 'error': f'Connection error: {str(e)}'}
     
-    def publish(self, site_config: Dict, title: str, content: str, status: str = 'draft') -> Dict:
+    def publish(self, site_config: Dict, title: str, content: str, status: str = 'draft', 
+                image_url: Optional[str] = None, tags: Optional[List[str]] = None) -> Dict:
         try:
             session = self._get_session(site_config)
             api_url = f"{site_config['wp_url']}/wp-json/wp/v2/posts"
@@ -451,6 +452,19 @@ class WordPressPublisher:
                 'status': status
             }
             
+            # Handle featured image
+            featured_media_id = None
+            if image_url:
+                featured_media_id = self._upload_image(site_config, image_url, title)
+                if featured_media_id:
+                    payload['featured_media'] = featured_media_id
+            
+            # Handle tags
+            if tags:
+                tag_ids = self._get_or_create_tags(site_config, tags)
+                if tag_ids:
+                    payload['tags'] = tag_ids
+            
             response = session.post(api_url, json=payload, timeout=30)
             
             if response.status_code == 201:
@@ -458,7 +472,9 @@ class WordPressPublisher:
                 return {
                     'success': True,
                     'post_id': post_id,
-                    'edit_url': f"{site_config['wp_url']}/wp-admin/post.php?post={post_id}&action=edit"
+                    'edit_url': f"{site_config['wp_url']}/wp-admin/post.php?post={post_id}&action=edit",
+                    'featured_image_set': featured_media_id is not None,
+                    'tags_set': len(tag_ids) if tags else 0
                 }
             elif response.status_code == 401:
                 return {
@@ -483,6 +499,89 @@ class WordPressPublisher:
                 }
         except Exception as e:
             return {'success': False, 'error': f'Error: {str(e)}'}
+    
+    def _upload_image(self, site_config: Dict, image_url: str, title: str) -> Optional[int]:
+        """Upload image to WordPress media library and return media ID"""
+        try:
+            session = self._get_session(site_config)
+            
+            # Download image
+            img_response = requests.get(image_url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+            if img_response.status_code != 200:
+                return None
+            
+            # Get filename from URL or generate one
+            from urllib.parse import urlparse
+            parsed = urlparse(image_url)
+            filename = parsed.path.split('/')[-1] or 'featured-image.jpg'
+            
+            # Determine content type
+            content_type = img_response.headers.get('content-type', 'image/jpeg')
+            
+            # Upload to WordPress
+            media_url = f"{site_config['wp_url']}/wp-json/wp/v2/media"
+            
+            files = {
+                'file': (filename, img_response.content, content_type)
+            }
+            
+            # Remove Content-Type header for multipart upload
+            upload_session = requests.Session()
+            upload_session.auth = session.auth
+            upload_session.headers.update({
+                'User-Agent': 'WordPress-Python-Client/1.0'
+            })
+            
+            response = upload_session.post(
+                media_url,
+                files=files,
+                data={'title': title[:100], 'alt_text': title[:100]},
+                timeout=30
+            )
+            
+            if response.status_code == 201:
+                return response.json()['id']
+            
+            return None
+            
+        except Exception as e:
+            return None
+    
+    def _get_or_create_tags(self, site_config: Dict, tag_names: List[str]) -> List[int]:
+        """Get or create WordPress tags and return their IDs"""
+        try:
+            session = self._get_session(site_config)
+            tags_url = f"{site_config['wp_url']}/wp-json/wp/v2/tags"
+            tag_ids = []
+            
+            for tag_name in tag_names[:5]:  # Limit to 5 tags
+                # Try to find existing tag
+                search_response = session.get(
+                    tags_url,
+                    params={'search': tag_name},
+                    timeout=10
+                )
+                
+                if search_response.status_code == 200:
+                    tags = search_response.json()
+                    if tags:
+                        tag_ids.append(tags[0]['id'])
+                        continue
+                
+                # Create new tag if not found
+                create_response = session.post(
+                    tags_url,
+                    json={'name': tag_name},
+                    timeout=10
+                )
+                
+                if create_response.status_code == 201:
+                    tag_ids.append(create_response.json()['id'])
+            
+            return tag_ids
+            
+        except Exception as e:
+            return []
 
 # ============= MAIN PROCESSOR =============
 class NewsProcessor:
@@ -492,6 +591,58 @@ class NewsProcessor:
         self.processor = ContentProcessor()
         self.images = ImageFetcher()
         self.publisher = WordPressPublisher()
+        self.used_urls = set()  # Track URLs used across all sites in this batch
+    
+    def _generate_tags(self, article_title: str, content: str, site_config: Dict) -> List[str]:
+        """Generate relevant tags for the article"""
+        tags = []
+        
+        # Add theme-based tags
+        theme_tags = {
+            'conservative': 'Conservative',
+            'politics': 'Politics',
+            'economy': 'Economy',
+            'breaking': 'Breaking News',
+            'world': 'World News',
+            'international': 'International',
+            'culture': 'Culture',
+            'national': 'National News',
+            'freedom': 'Freedom',
+            'america': 'America'
+        }
+        
+        for theme in site_config.get('themes', []):
+            if theme in theme_tags:
+                tags.append(theme_tags[theme])
+        
+        # Extract keywords from title
+        title_lower = article_title.lower()
+        keyword_map = {
+            'trump': 'Donald Trump',
+            'biden': 'Joe Biden',
+            'election': 'Election',
+            'border': 'Border Security',
+            'immigration': 'Immigration',
+            'tax': 'Tax Policy',
+            'crime': 'Crime',
+            'gun': 'Second Amendment',
+            'abortion': 'Pro-Life',
+            'china': 'China',
+            'russia': 'Russia',
+            'ukraine': 'Ukraine',
+            'israel': 'Israel',
+            'middle east': 'Middle East',
+            'supreme court': 'Supreme Court',
+            'congress': 'Congress',
+            'senate': 'Senate'
+        }
+        
+        for keyword, tag in keyword_map.items():
+            if keyword in title_lower and tag not in tags:
+                tags.append(tag)
+        
+        # Limit to 5 most relevant tags
+        return tags[:5]
     
     def process_site(self, site_key: str, site_config: Dict) -> List[Dict]:
         processed = []
@@ -501,6 +652,10 @@ class NewsProcessor:
         for article in articles:
             if len(processed) >= ClickMovementConfig.ARTICLES_PER_SITE:
                 break
+            
+            # Skip if URL already used by another site in this batch
+            if article['link'] in self.used_urls:
+                continue
             
             if self.db.is_duplicate(article['title'], site_key):
                 continue
@@ -515,6 +670,9 @@ class NewsProcessor:
             
             image_urls = self.images.fetch_images(article['link'])
             
+            # Generate tags
+            tags = self._generate_tags(article['title'], rewritten, site_config)
+            
             processed.append({
                 'original_title': article['title'],
                 'headlines': headlines if headlines else [article['title']],
@@ -525,8 +683,12 @@ class NewsProcessor:
                 'images': image_urls,
                 'selected_image': image_urls[0] if image_urls else None,
                 'word_count': len(rewritten.split()),
-                'site_config': site_config
+                'site_config': site_config,
+                'tags': tags
             })
+            
+            # Mark URL as used for this batch
+            self.used_urls.add(article['link'])
             
             self.db.add_processed(article['title'], article['source'], site_key)
         
@@ -683,6 +845,11 @@ if st.session_state.processed_articles:
                     if article_id in st.session_state.published:
                         st.caption("Status: PUBLISHED")
                 
+                # Display tags
+                if article.get('tags'):
+                    st.write("**Tags:**")
+                    st.caption(", ".join(article['tags']))
+                
                 if article['images']:
                     st.write("**Images:**")
                     img_cols = st.columns(min(3, len(article['images'])))
@@ -711,10 +878,17 @@ if st.session_state.processed_articles:
                             site_config,
                             selected_headline,
                             article['content'],
-                            'draft'
+                            'draft',
+                            image_url=article.get('selected_image'),
+                            tags=article.get('tags', [])
                         )
                         if result['success']:
-                            st.success(f"Draft created! [Edit]({result['edit_url']})")
+                            success_msg = f"Draft created! [Edit]({result['edit_url']})"
+                            if result.get('featured_image_set'):
+                                success_msg += " ✓ Image set"
+                            if result.get('tags_set', 0) > 0:
+                                success_msg += f" ✓ {result['tags_set']} tags"
+                            st.success(success_msg)
                             st.session_state.published.add(article_id)
                             st.rerun()
                         else:
@@ -730,10 +904,17 @@ if st.session_state.processed_articles:
                             site_config,
                             selected_headline,
                             article['content'],
-                            'publish'
+                            'publish',
+                            image_url=article.get('selected_image'),
+                            tags=article.get('tags', [])
                         )
                         if result['success']:
-                            st.success(f"Published! [View]({result['edit_url']})")
+                            success_msg = f"Published! [View]({result['edit_url']})"
+                            if result.get('featured_image_set'):
+                                success_msg += " ✓ Image set"
+                            if result.get('tags_set', 0) > 0:
+                                success_msg += f" ✓ {result['tags_set']} tags"
+                            st.success(success_msg)
                             st.session_state.published.add(article_id)
                             st.rerun()
                         else:

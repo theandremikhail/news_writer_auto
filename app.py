@@ -9,11 +9,11 @@ import time
 import re
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urljoin
-import sqlite3
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from PIL import Image
+from supabase import create_client, Client
 
 # ============= CONFIGURATION =============
 class ClickMovementConfig:
@@ -102,45 +102,62 @@ class ClickMovementConfig:
     MAX_WORDS = 800
     ARTICLES_PER_SITE = 10
     ANTHROPIC_KEY = st.secrets.get("anthropic_key", "")
+    SUPABASE_URL = st.secrets.get("supabase_url", "")
+    SUPABASE_KEY = st.secrets.get("supabase_key", "")
 
-# ============= DATABASE =============
-class ArticleDatabase:
+# ============= SUPABASE DATABASE =============
+class SupabaseDatabase:
     def __init__(self):
-        self.conn = sqlite3.connect('news_articles.db', check_same_thread=False)
-        self.create_tables()
-    
-    def create_tables(self):
-        self.conn.execute('''
-            CREATE TABLE IF NOT EXISTS processed_articles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                article_hash TEXT UNIQUE,
-                title TEXT,
-                source TEXT,
-                site TEXT,
-                processed_at TIMESTAMP,
-                published BOOLEAN DEFAULT 0
+        if ClickMovementConfig.SUPABASE_URL and ClickMovementConfig.SUPABASE_KEY:
+            self.client: Client = create_client(
+                ClickMovementConfig.SUPABASE_URL,
+                ClickMovementConfig.SUPABASE_KEY
             )
-        ''')
-        self.conn.commit()
+        else:
+            self.client = None
+            st.warning("⚠️ Supabase not configured. Duplicate detection disabled.")
     
-    def is_duplicate(self, title: str, site: str, hours: int = 48) -> bool:
-        article_hash = hashlib.md5(f"{title}_{site}".encode()).hexdigest()
-        cutoff = datetime.now() - timedelta(hours=hours)
-        cursor = self.conn.execute(
-            'SELECT 1 FROM processed_articles WHERE article_hash = ? AND processed_at > ?',
-            (article_hash, cutoff)
-        )
-        return cursor.fetchone() is not None
-    
-    def add_processed(self, title: str, source: str, site: str):
-        article_hash = hashlib.md5(f"{title}_{site}".encode()).hexdigest()
+    def is_duplicate(self, url: str, content: str, site: str) -> bool:
+        """Check if article is duplicate by URL or similar content"""
+        if not self.client:
+            return False
+        
         try:
-            self.conn.execute(
-                'INSERT INTO processed_articles (article_hash, title, source, site, processed_at) VALUES (?, ?, ?, ?, ?)',
-                (article_hash, title, source, site, datetime.now())
-            )
-            self.conn.commit()
-        except:
+            url_hash = hashlib.md5(url.encode()).hexdigest()
+            content_hash = hashlib.md5(content[:1000].encode()).hexdigest()
+            
+            # Check if URL was already processed (prevents same article across sites)
+            url_check = self.client.table('processed_articles').select('id').eq('url_hash', url_hash).execute()
+            if url_check.data:
+                return True
+            
+            # Check if similar content exists (prevents day-over-day duplicates)
+            content_check = self.client.table('processed_articles').select('id').eq('content_hash', content_hash).eq('site', site).execute()
+            if content_check.data:
+                return True
+            
+            return False
+        except Exception as e:
+            st.warning(f"Duplicate check error: {str(e)}")
+            return False
+    
+    def add_processed(self, url: str, content: str, title: str, site: str):
+        """Add processed article to database"""
+        if not self.client:
+            return
+        
+        try:
+            url_hash = hashlib.md5(url.encode()).hexdigest()
+            content_hash = hashlib.md5(content[:1000].encode()).hexdigest()
+            
+            self.client.table('processed_articles').insert({
+                'url_hash': url_hash,
+                'content_hash': content_hash,
+                'title': title,
+                'site': site
+            }).execute()
+        except Exception as e:
+            # Ignore duplicate errors
             pass
 
 # ============= NEWS FETCHER =============
@@ -373,6 +390,53 @@ class ImageFetcher:
             return False
         valid_extensions = ['.jpg', '.jpeg', '.png', '.webp']
         return any(ext in url_lower for ext in valid_extensions) or 'image' in url_lower
+    
+    def resize_image(self, image_url: str) -> Optional[BytesIO]:
+        """Resize image to 860x475 pixels"""
+        try:
+            response = requests.get(image_url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+            if response.status_code != 200:
+                return None
+            
+            img = Image.open(BytesIO(response.content))
+            
+            # Convert to RGB if necessary
+            if img.mode in ('RGBA', 'LA', 'P'):
+                img = img.convert('RGB')
+            
+            # Target dimensions
+            target_width = 860
+            target_height = 475
+            
+            # Calculate aspect ratios
+            img_aspect = img.width / img.height
+            target_aspect = target_width / target_height
+            
+            if img_aspect > target_aspect:
+                # Image is wider - fit to height, crop width
+                new_height = target_height
+                new_width = int(target_height * img_aspect)
+                img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                # Crop from center
+                left = (new_width - target_width) // 2
+                img = img.crop((left, 0, left + target_width, target_height))
+            else:
+                # Image is taller - fit to width, crop height
+                new_width = target_width
+                new_height = int(target_width / img_aspect)
+                img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                # Crop from center
+                top = (new_height - target_height) // 2
+                img = img.crop((0, top, target_width, top + target_height))
+            
+            # Save to BytesIO
+            output = BytesIO()
+            img.save(output, format='JPEG', quality=90)
+            output.seek(0)
+            return output
+            
+        except Exception as e:
+            return None
 
 # ============= WORDPRESS PUBLISHER =============
 class WordPressPublisher:
@@ -429,14 +493,59 @@ class WordPressPublisher:
         except Exception as e:
             return {'success': False, 'error': f'Connection error: {str(e)}'}
     
+    def get_recent_posts(self, site_config: Dict, limit: int = 10) -> List[Dict]:
+        """Get recent posts from last 7 days for internal linking"""
+        try:
+            session = self._get_session(site_config)
+            seven_days_ago = (datetime.now() - timedelta(days=7)).isoformat()
+            
+            api_url = f"{site_config['wp_url']}/wp-json/wp/v2/posts"
+            response = session.get(
+                api_url,
+                params={
+                    'per_page': limit,
+                    'after': seven_days_ago,
+                    'status': 'publish',
+                    'orderby': 'date',
+                    'order': 'desc'
+                },
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                posts = response.json()
+                return [{'title': p['title']['rendered'], 'link': p['link']} for p in posts]
+            
+            return []
+        except Exception as e:
+            return []
+    
+    def add_internal_link(self, content: str, site_config: Dict) -> str:
+        """Add one internal link at the end of the article"""
+        recent_posts = self.get_recent_posts(site_config, limit=5)
+        
+        if not recent_posts:
+            return content
+        
+        # Pick a random recent post
+        import random
+        post = random.choice(recent_posts)
+        
+        # Add link at the end
+        internal_link = f'\n\n<p><strong>Related:</strong> <a href="{post["link"]}">{post["title"]}</a></p>'
+        return content + internal_link
+    
     def publish(self, site_config: Dict, title: str, content: str, status: str = 'draft', 
                 image_url: Optional[str] = None, tags: Optional[List[str]] = None) -> Dict:
         try:
             session = self._get_session(site_config)
             api_url = f"{site_config['wp_url']}/wp-json/wp/v2/posts"
             
+            # Add internal link
+            content_with_link = self.add_internal_link(content, site_config)
+            
             # Clean content - remove duplicate H1 tags
-            content_cleaned = re.sub(r'<h1>.*?</h1>', '', content, flags=re.IGNORECASE)
+            content_cleaned = re.sub(r'<h1>.*?</h1>', '', content_with_link, flags=re.IGNORECASE)
             
             # Ensure proper paragraph formatting
             if '<p>' not in content_cleaned:
@@ -460,6 +569,7 @@ class WordPressPublisher:
                     payload['featured_media'] = featured_media_id
             
             # Handle tags
+            tag_ids = []
             if tags:
                 tag_ids = self._get_or_create_tags(site_config, tags)
                 if tag_ids:
@@ -474,7 +584,8 @@ class WordPressPublisher:
                     'post_id': post_id,
                     'edit_url': f"{site_config['wp_url']}/wp-admin/post.php?post={post_id}&action=edit",
                     'featured_image_set': featured_media_id is not None,
-                    'tags_set': len(tag_ids) if tags else 0
+                    'tags_set': len(tag_ids),
+                    'internal_link_added': True
                 }
             elif response.status_code == 401:
                 return {
@@ -501,28 +612,22 @@ class WordPressPublisher:
             return {'success': False, 'error': f'Error: {str(e)}'}
     
     def _upload_image(self, site_config: Dict, image_url: str, title: str) -> Optional[int]:
-        """Upload image to WordPress media library and return media ID"""
+        """Upload resized image to WordPress media library and return media ID"""
         try:
             session = self._get_session(site_config)
             
-            # Download image
-            img_response = requests.get(image_url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
-            if img_response.status_code != 200:
+            # Resize image
+            image_fetcher = ImageFetcher()
+            resized_image = image_fetcher.resize_image(image_url)
+            
+            if not resized_image:
                 return None
-            
-            # Get filename from URL or generate one
-            from urllib.parse import urlparse
-            parsed = urlparse(image_url)
-            filename = parsed.path.split('/')[-1] or 'featured-image.jpg'
-            
-            # Determine content type
-            content_type = img_response.headers.get('content-type', 'image/jpeg')
             
             # Upload to WordPress
             media_url = f"{site_config['wp_url']}/wp-json/wp/v2/media"
             
             files = {
-                'file': (filename, img_response.content, content_type)
+                'file': ('featured-image.jpg', resized_image, 'image/jpeg')
             }
             
             # Remove Content-Type header for multipart upload
@@ -554,7 +659,7 @@ class WordPressPublisher:
             tags_url = f"{site_config['wp_url']}/wp-json/wp/v2/tags"
             tag_ids = []
             
-            for tag_name in tag_names[:5]:  # Limit to 5 tags
+            for tag_name in tag_names[:5]:
                 # Try to find existing tag
                 search_response = session.get(
                     tags_url,
@@ -586,18 +691,17 @@ class WordPressPublisher:
 # ============= MAIN PROCESSOR =============
 class NewsProcessor:
     def __init__(self):
-        self.db = ArticleDatabase()
+        self.db = SupabaseDatabase()
         self.fetcher = NewsFetcher()
         self.processor = ContentProcessor()
         self.images = ImageFetcher()
         self.publisher = WordPressPublisher()
-        self.used_urls = set()  # Track URLs used across all sites in this batch
+        self.used_urls = set()
     
     def _generate_tags(self, article_title: str, content: str, site_config: Dict) -> List[str]:
         """Generate relevant tags for the article"""
         tags = []
         
-        # Add theme-based tags
         theme_tags = {
             'conservative': 'Conservative',
             'politics': 'Politics',
@@ -615,7 +719,6 @@ class NewsProcessor:
             if theme in theme_tags:
                 tags.append(theme_tags[theme])
         
-        # Extract keywords from title
         title_lower = article_title.lower()
         keyword_map = {
             'trump': 'Donald Trump',
@@ -641,7 +744,6 @@ class NewsProcessor:
             if keyword in title_lower and tag not in tags:
                 tags.append(tag)
         
-        # Limit to 5 most relevant tags
         return tags[:5]
     
     def process_site(self, site_key: str, site_config: Dict) -> List[Dict]:
@@ -653,21 +755,25 @@ class NewsProcessor:
             if len(processed) >= ClickMovementConfig.ARTICLES_PER_SITE:
                 break
             
-            # Skip if URL already used by another site in this batch
+            # Skip if URL already used in this batch
             if article['link'] in self.used_urls:
                 continue
             
-            if self.db.is_duplicate(article['title'], site_key):
-                continue
-            
+            # Scrape content first to check for duplicates
             full_content = self.processor.scrape_article(article['link'])
             if not full_content or len(full_content.split()) < 200:
                 continue
             
+            # Check Supabase for duplicates (by URL and content similarity)
+            if self.db.is_duplicate(article['link'], full_content, site_key):
+                continue
+            
+            # Rewrite
             rewritten, headlines = self.processor.rewrite_article(full_content, site_config)
             if not rewritten or len(rewritten.split()) < ClickMovementConfig.MIN_WORDS:
                 continue
             
+            # Fetch images
             image_urls = self.images.fetch_images(article['link'])
             
             # Generate tags
@@ -687,10 +793,9 @@ class NewsProcessor:
                 'tags': tags
             })
             
-            # Mark URL as used for this batch
+            # Mark URL as used and add to Supabase
             self.used_urls.add(article['link'])
-            
-            self.db.add_processed(article['title'], article['source'], site_key)
+            self.db.add_processed(article['link'], rewritten, article['title'], site_key)
         
         return processed
 
@@ -766,22 +871,38 @@ with st.expander("🔧 Troubleshooting WordPress 403 Errors"):
     Click **"Test Connections"** button below to diagnose the issue.
     """)
 
-col1, col2, col3 = st.columns([2, 1.5, 1])
+# Site Selector
+col_selector, col1, col2, col3 = st.columns([1.5, 1.5, 1.5, 1])
+
+with col_selector:
+    site_options = ["All Sites"] + [config['name'] for config in ClickMovementConfig.WORDPRESS_SITES.values()]
+    selected_site = st.selectbox(
+        "Select Site to Process",
+        site_options,
+        key="site_selector"
+    )
 
 with col1:
     if st.button("Fetch & Process Articles", type="primary", use_container_width=True):
         processor = NewsProcessor()
         results = {}
         
-        progress = st.progress(0)
-        sites = list(ClickMovementConfig.WORDPRESS_SITES.items())
+        # Determine which sites to process
+        if selected_site == "All Sites":
+            sites_to_process = list(ClickMovementConfig.WORDPRESS_SITES.items())
+        else:
+            # Find the matching site key
+            site_key = [k for k, v in ClickMovementConfig.WORDPRESS_SITES.items() if v['name'] == selected_site][0]
+            sites_to_process = [(site_key, ClickMovementConfig.WORDPRESS_SITES[site_key])]
         
-        for idx, (site_key, site_config) in enumerate(sites):
+        progress = st.progress(0)
+        
+        for idx, (site_key, site_config) in enumerate(sites_to_process):
             with st.spinner(f"Processing {site_config['name']}..."):
                 processed = processor.process_site(site_key, site_config)
                 results[site_key] = processed
                 st.info(f"✓ {site_config['name']}: Found {len(processed)} articles")
-                progress.progress((idx + 1) / len(sites))
+                progress.progress((idx + 1) / len(sites_to_process))
         
         st.session_state.processed_articles = results
         total = sum(len(articles) for articles in results.values())
@@ -845,11 +966,11 @@ if st.session_state.processed_articles:
                         range(len(image_options)),
                         format_func=lambda x: image_options[x],
                         key=f"image_{article_id}",
-                        index=1 if article['images'] else 0  # Default to first image
+                        index=1 if article['images'] else 0
                     )
                     if selected_image_idx > 0:
                         selected_image = article['images'][selected_image_idx - 1]
-                        st.caption(f"✓ Will use: {image_options[selected_image_idx]}")
+                        st.caption(f"✓ Will use: {image_options[selected_image_idx]} (resized to 860x475px)")
                 
                 col1, col2, col3 = st.columns(3)
                 with col1:
@@ -860,7 +981,6 @@ if st.session_state.processed_articles:
                     if article_id in st.session_state.published:
                         st.caption("Status: PUBLISHED")
                 
-                # Display tags
                 if article.get('tags'):
                     st.write("**Tags:**")
                     st.caption(", ".join(article['tags']))
@@ -874,7 +994,6 @@ if st.session_state.processed_articles:
                                 response = requests.get(img_url, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
                                 img = Image.open(BytesIO(response.content))
                                 st.image(img, use_container_width=True)
-                                # Highlight selected image
                                 if selected_image and img_url == selected_image:
                                     st.caption(f"**Image {img_idx+1}** ⭐ Selected")
                                 else:
@@ -905,9 +1024,11 @@ if st.session_state.processed_articles:
                         if result['success']:
                             success_msg = f"Draft created! [Edit]({result['edit_url']})"
                             if result.get('featured_image_set'):
-                                success_msg += " ✓ Image set"
+                                success_msg += " ✓ Image"
                             if result.get('tags_set', 0) > 0:
                                 success_msg += f" ✓ {result['tags_set']} tags"
+                            if result.get('internal_link_added'):
+                                success_msg += " ✓ Internal link"
                             st.success(success_msg)
                             st.session_state.published.add(article_id)
                             st.rerun()
@@ -931,9 +1052,11 @@ if st.session_state.processed_articles:
                         if result['success']:
                             success_msg = f"Published! [View]({result['edit_url']})"
                             if result.get('featured_image_set'):
-                                success_msg += " ✓ Image set"
+                                success_msg += " ✓ Image"
                             if result.get('tags_set', 0) > 0:
                                 success_msg += f" ✓ {result['tags_set']} tags"
+                            if result.get('internal_link_added'):
+                                success_msg += " ✓ Internal link"
                             st.success(success_msg)
                             st.session_state.published.add(article_id)
                             st.rerun()

@@ -162,7 +162,7 @@ class SupabaseDatabase:
 
 # ============= NEWS FETCHER =============
 class NewsFetcher:
-    def fetch_articles(self, themes: List[str]) -> List[Dict]:
+    def fetch_articles(self, themes: List[str], limit: int = 50) -> List[Dict]:
         all_articles = []
         categories = self._get_categories(themes)
         
@@ -182,7 +182,7 @@ class NewsFetcher:
                     continue
         
         all_articles.sort(key=lambda x: x['score'], reverse=True)
-        return all_articles[:50]
+        return all_articles[:limit]
     
     def _get_categories(self, themes):
         cats = set()
@@ -365,7 +365,7 @@ class ImageFetcher:
                 if img_url and self._is_valid_image(img_url):
                     images.append(urljoin(url, img_url))
             
-            for img in soup.select('article img, .article-body img, .entry-content img')[:8]:
+            for img in soup.select('article img, .article-body img, .entry-content img')[:15]:
                 src = img.get('data-src') or img.get('src')
                 if src and self._is_valid_image(src):
                     images.append(urljoin(url, src))
@@ -377,7 +377,7 @@ class ImageFetcher:
                     seen.add(img)
                     unique_images.append(img)
             
-            return unique_images[:5]
+            return unique_images[:12]  # Return up to 12 images
         except Exception as e:
             return []
     
@@ -755,12 +755,13 @@ class NewsProcessor:
         for site_config in ClickMovementConfig.WORDPRESS_SITES.values():
             all_themes.update(site_config['themes'])
         
-        articles = self.fetcher.fetch_articles(list(all_themes))
+        # Fetch MORE articles to account for filtering (3x the target)
+        articles = self.fetcher.fetch_articles(list(all_themes), limit=num_articles * 3)
         
         # Use first site's config for generic rewriting
         generic_config = list(ClickMovementConfig.WORDPRESS_SITES.values())[0]
         
-        for article in articles[:num_articles * 2]:  # Get more to allow filtering
+        for article in articles:
             if len(processed) >= num_articles:
                 break
             
@@ -801,6 +802,7 @@ class NewsProcessor:
                 'source': article['source'],
                 'url': article['link'],
                 'images': image_urls,
+                'image_page': 0,  # Track which page of images we're viewing
                 'word_count': len(rewritten.split()),
                 'tags': tags
             })
@@ -962,53 +964,72 @@ if st.session_state.processed_articles:
             if not selected_sites and article_id not in st.session_state.published:
                 st.warning("⚠️ Select at least one site to publish")
             
-            # Image selection with refresh button
-            col_img_sel, col_img_refresh = st.columns([3, 1])
-            
-            with col_img_sel:
-                selected_image = None
-                if article['images']:
-                    image_options = ["No Featured Image"] + [f"Image {i+1}" for i in range(len(article['images']))]
-                    selected_image_idx = st.selectbox(
-                        "Select Featured Image",
-                        range(len(image_options)),
-                        format_func=lambda x: image_options[x],
-                        key=f"image_{article_id}",
-                        index=1 if article['images'] else 0
-                    )
-                    if selected_image_idx > 0:
-                        selected_image = article['images'][selected_image_idx - 1]
-                        st.caption(f"✓ Will use: {image_options[selected_image_idx]} (860x475px)")
-                else:
-                    st.caption("No images found")
-            
-            with col_img_refresh:
-                st.write("")  # Spacing
-                st.write("")  # Spacing
-                if st.button("🔄 Refresh", key=f"refresh_img_{article_id}", use_container_width=True):
-                    image_fetcher = ImageFetcher()
-                    new_images = image_fetcher.fetch_images(article['url'])
-                    st.session_state.processed_articles[idx]['images'] = new_images
-                    st.success(f"Found {len(new_images)} images!")
-                    time.sleep(0.5)
-                    st.rerun()
-            
-            # Display images
+            # Image selection with next/previous arrows
             if article['images']:
-                st.write("**Available Images:**")
-                img_cols = st.columns(min(3, len(article['images'])))
-                for img_idx, img_url in enumerate(article['images'][:3]):
+                col_prev, col_img_sel, col_next = st.columns([0.5, 3, 0.5])
+                
+                with col_prev:
+                    st.write("")  # Spacing
+                    st.write("")  # Spacing
+                    if st.button("◀", key=f"prev_img_{article_id}", use_container_width=True):
+                        if article['image_page'] > 0:
+                            st.session_state.processed_articles[idx]['image_page'] -= 1
+                            st.rerun()
+                
+                with col_img_sel:
+                    # Calculate which images to show (3 per page)
+                    page = article.get('image_page', 0)
+                    start_idx = page * 3
+                    end_idx = min(start_idx + 3, len(article['images']))
+                    visible_images = article['images'][start_idx:end_idx]
+                    
+                    if visible_images:
+                        image_options = ["No Featured Image"] + [f"Image {start_idx + i + 1}" for i in range(len(visible_images))]
+                        selected_image_idx = st.selectbox(
+                            f"Select Featured Image (Page {page + 1}/{(len(article['images']) - 1) // 3 + 1})",
+                            range(len(image_options)),
+                            format_func=lambda x: image_options[x],
+                            key=f"image_{article_id}",
+                            index=1 if visible_images else 0
+                        )
+                        
+                        if selected_image_idx > 0:
+                            selected_image = visible_images[selected_image_idx - 1]
+                            st.caption(f"✓ Will use: {image_options[selected_image_idx]} (860x475px)")
+                        else:
+                            selected_image = None
+                    else:
+                        selected_image = None
+                        st.caption("No images on this page")
+                
+                with col_next:
+                    st.write("")  # Spacing
+                    st.write("")  # Spacing
+                    max_page = (len(article['images']) - 1) // 3
+                    if st.button("▶", key=f"next_img_{article_id}", use_container_width=True):
+                        if article.get('image_page', 0) < max_page:
+                            st.session_state.processed_articles[idx]['image_page'] += 1
+                            st.rerun()
+                
+                # Display current page of images
+                st.write(f"**Available Images (Showing {start_idx + 1}-{end_idx} of {len(article['images'])}):**")
+                img_cols = st.columns(min(3, len(visible_images)))
+                for img_idx, img_url in enumerate(visible_images):
                     with img_cols[img_idx]:
                         try:
                             response = requests.get(img_url, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
                             img = Image.open(BytesIO(response.content))
                             st.image(img, use_container_width=True)
+                            global_idx = start_idx + img_idx + 1
                             if selected_image and img_url == selected_image:
-                                st.caption(f"**Image {img_idx+1}** ⭐ Selected")
+                                st.caption(f"**Image {global_idx}** ⭐ Selected")
                             else:
-                                st.caption(f"Image {img_idx+1}")
+                                st.caption(f"Image {global_idx}")
                         except Exception as e:
-                            st.warning(f"⚠️ Image {img_idx+1} failed")
+                            st.warning(f"⚠️ Image failed")
+            else:
+                selected_image = None
+                st.caption("No images found")
             
             # Tags
             if article.get('tags'):

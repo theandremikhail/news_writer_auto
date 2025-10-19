@@ -746,64 +746,74 @@ class NewsProcessor:
         
         return tags[:5]
     
-    def process_site(self, site_key: str, site_config: Dict) -> List[Dict]:
+    def process_articles(self, themes: List[str], num_articles: int = 20) -> List[Dict]:
+        """Process articles without assigning to specific sites"""
         processed = []
         
-        articles = self.fetcher.fetch_articles(site_config['themes'])
+        articles = self.fetcher.fetch_articles(themes)
         
-        for article in articles:
-            if len(processed) >= ClickMovementConfig.ARTICLES_PER_SITE:
+        for article in articles[:num_articles * 2]:  # Get more to filter
+            if len(processed) >= num_articles:
                 break
             
             # Skip if URL already used in this batch
             if article['link'] in self.used_urls:
                 continue
             
-            # Scrape content first to check for duplicates
+            # Scrape content first
             full_content = self.processor.scrape_article(article['link'])
             if not full_content or len(full_content.split()) < 200:
                 continue
             
-            # Check Supabase for duplicates (by URL and content similarity)
-            if self.db.is_duplicate(article['link'], full_content, site_key):
-                continue
+            # Check Supabase for duplicates across all sites
+            is_dup = False
+            for site_key in ClickMovementConfig.WORDPRESS_SITES.keys():
+                if self.db.is_duplicate(article['link'], full_content, site_key):
+                    is_dup = True
+                    break
             
-            # Rewrite
-            rewritten, headlines = self.processor.rewrite_article(full_content, site_config)
-            if not rewritten or len(rewritten.split()) < ClickMovementConfig.MIN_WORDS:
+            if is_dup:
                 continue
             
             # Fetch images
             image_urls = self.images.fetch_images(article['link'])
             
-            # Generate tags
-            tags = self._generate_tags(article['title'], rewritten, site_config)
-            
             processed.append({
                 'original_title': article['title'],
-                'headlines': headlines if headlines else [article['title']],
-                'selected_headline': headlines[0] if headlines else article['title'],
-                'content': rewritten,
+                'summary': article['summary'],
                 'source': article['source'],
                 'url': article['link'],
+                'raw_content': full_content,
                 'images': image_urls,
-                'selected_image': image_urls[0] if image_urls else None,
-                'word_count': len(rewritten.split()),
-                'site_config': site_config,
-                'tags': tags
+                'word_count': len(full_content.split())
             })
             
-            # Mark URL as used and add to Supabase
+            # Mark URL as used
             self.used_urls.add(article['link'])
-            self.db.add_processed(article['link'], rewritten, article['title'], site_key)
         
         return processed
+    
+    def rewrite_for_site(self, article: Dict, site_config: Dict) -> Dict:
+        """Rewrite article for a specific site"""
+        rewritten, headlines = self.processor.rewrite_article(article['raw_content'], site_config)
+        
+        if not rewritten or len(rewritten.split()) < ClickMovementConfig.MIN_WORDS:
+            return None
+        
+        tags = self._generate_tags(article['original_title'], rewritten, site_config)
+        
+        return {
+            'headlines': headlines if headlines else [article['original_title']],
+            'content': rewritten,
+            'tags': tags,
+            'word_count': len(rewritten.split())
+        }
 
 # ============= STREAMLIT UI =============
 st.set_page_config(page_title="News Intelligence Dashboard", layout="wide")
 
 if 'processed_articles' not in st.session_state:
-    st.session_state.processed_articles = {}
+    st.session_state.processed_articles = []
 if 'published' not in st.session_state:
     st.session_state.published = set()
 
@@ -871,45 +881,28 @@ with st.expander("🔧 Troubleshooting WordPress 403 Errors"):
     Click **"Test Connections"** button below to diagnose the issue.
     """)
 
-# Site Selector
-col_selector, col1, col2, col3 = st.columns([1.5, 1.5, 1.5, 1])
-
-with col_selector:
-    site_options = ["All Sites"] + [config['name'] for config in ClickMovementConfig.WORDPRESS_SITES.values()]
-    selected_site = st.selectbox(
-        "Select Site to Process",
-        site_options,
-        key="site_selector"
-    )
+# Site Selector and Controls
+col1, col2, col3, col4 = st.columns([1.5, 1.5, 1.5, 1])
 
 with col1:
-    if st.button("Fetch & Process Articles", type="primary", use_container_width=True):
-        processor = NewsProcessor()
-        results = {}
-        
-        # Determine which sites to process
-        if selected_site == "All Sites":
-            sites_to_process = list(ClickMovementConfig.WORDPRESS_SITES.items())
-        else:
-            # Find the matching site key
-            site_key = [k for k, v in ClickMovementConfig.WORDPRESS_SITES.items() if v['name'] == selected_site][0]
-            sites_to_process = [(site_key, ClickMovementConfig.WORDPRESS_SITES[site_key])]
-        
-        progress = st.progress(0)
-        
-        for idx, (site_key, site_config) in enumerate(sites_to_process):
-            with st.spinner(f"Processing {site_config['name']}..."):
-                processed = processor.process_site(site_key, site_config)
-                results[site_key] = processed
-                st.info(f"✓ {site_config['name']}: Found {len(processed)} articles")
-                progress.progress((idx + 1) / len(sites_to_process))
-        
-        st.session_state.processed_articles = results
-        total = sum(len(articles) for articles in results.values())
-        st.success(f"Processed {total} articles!")
-        st.rerun()
+    num_articles = st.number_input("Number of Articles", min_value=5, max_value=50, value=20, step=5)
 
 with col2:
+    if st.button("Fetch Articles", type="primary", use_container_width=True):
+        processor = NewsProcessor()
+        
+        # Use combined themes from all sites
+        all_themes = set()
+        for site_config in ClickMovementConfig.WORDPRESS_SITES.values():
+            all_themes.update(site_config['themes'])
+        
+        with st.spinner(f"Fetching {num_articles} articles..."):
+            articles = processor.process_articles(list(all_themes), num_articles)
+            st.session_state.processed_articles = articles
+            st.success(f"Fetched {len(articles)} articles!")
+            st.rerun()
+
+with col3:
     if st.button("Test Connections", use_container_width=True):
         publisher = WordPressPublisher()
         for site_key, site_config in ClickMovementConfig.WORDPRESS_SITES.items():
@@ -919,14 +912,14 @@ with col2:
             else:
                 st.error(f"❌ {site_config['name']}: {result['error']}")
 
-with col3:
+with col4:
     if st.button("Clear All", use_container_width=True):
-        st.session_state.processed_articles = {}
+        st.session_state.processed_articles = []
         st.session_state.published = set()
         st.rerun()
 
 if st.session_state.processed_articles:
-    total = sum(len(a) for a in st.session_state.processed_articles.values())
+    total = len(st.session_state.processed_articles)
     published = len(st.session_state.published)
     
     col1, col2, col3 = st.columns(3)
@@ -937,27 +930,45 @@ if st.session_state.processed_articles:
     with col3:
         st.markdown(f'<div class="stat-box"><h2>{total-published}</h2><p>Ready</p></div>', unsafe_allow_html=True)
 
+# Display articles
 if st.session_state.processed_articles:
-    for site_key, articles in st.session_state.processed_articles.items():
-        if not articles:
-            continue
+    st.markdown("---")
+    
+    for idx, article in enumerate(st.session_state.processed_articles):
+        article_id = f"article_{idx}"
         
-        site_config = ClickMovementConfig.WORDPRESS_SITES[site_key]
-        st.markdown(f"### {site_config['name']}")
-        
-        for idx, article in enumerate(articles):
-            article_id = f"{site_key}_{idx}"
+        with st.container():
+            st.markdown('<div class="article-card">', unsafe_allow_html=True)
             
-            with st.container():
-                st.markdown('<div class="article-card">', unsafe_allow_html=True)
-                
-                selected_headline = st.selectbox(
-                    "Select Headline",
-                    article['headlines'],
-                    key=f"headline_{article_id}"
-                )
-                
-                # Image selection
+            # Article header
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.markdown(f"### {article['original_title']}")
+                st.caption(f"Source: {article['source']} | Words: ~{article['word_count']}")
+            with col2:
+                if article_id in st.session_state.published:
+                    st.success("✓ Published")
+            
+            # Site selection checkboxes
+            st.write("**Publish to:**")
+            selected_sites = []
+            cols = st.columns(4)
+            for idx_site, (site_key, site_config) in enumerate(ClickMovementConfig.WORDPRESS_SITES.items()):
+                with cols[idx_site]:
+                    if st.checkbox(
+                        site_config['name'],
+                        key=f"{article_id}_site_{site_key}",
+                        disabled=article_id in st.session_state.published
+                    ):
+                        selected_sites.append((site_key, site_config))
+            
+            if not selected_sites and article_id not in st.session_state.published:
+                st.warning("⚠️ Select at least one site to publish")
+            
+            # Image selection with refresh
+            col_img_sel, col_img_refresh = st.columns([3, 1])
+            
+            with col_img_sel:
                 selected_image = None
                 if article['images']:
                     image_options = ["No Featured Image"] + [f"Image {i+1}" for i in range(len(article['images']))]
@@ -970,115 +981,109 @@ if st.session_state.processed_articles:
                     )
                     if selected_image_idx > 0:
                         selected_image = article['images'][selected_image_idx - 1]
-                        st.caption(f"✓ Will use: {image_options[selected_image_idx]} (resized to 860x475px)")
-                
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.caption(f"Source: {article['source']}")
-                with col2:
-                    st.caption(f"Words: {article['word_count']}")
-                with col3:
-                    if article_id in st.session_state.published:
-                        st.caption("Status: PUBLISHED")
-                
-                if article.get('tags'):
-                    st.write("**Tags:**")
-                    st.caption(", ".join(article['tags']))
-                
-                if article['images']:
-                    st.write("**Available Images:**")
-                    img_cols = st.columns(min(3, len(article['images'])))
-                    for img_idx, img_url in enumerate(article['images'][:3]):
-                        with img_cols[img_idx]:
-                            try:
-                                response = requests.get(img_url, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
-                                img = Image.open(BytesIO(response.content))
-                                st.image(img, use_container_width=True)
-                                if selected_image and img_url == selected_image:
-                                    st.caption(f"**Image {img_idx+1}** ⭐ Selected")
-                                else:
-                                    st.caption(f"Image {img_idx+1}")
-                                st.caption(f"[Link]({img_url})")
-                            except Exception as e:
-                                st.warning(f"⚠️ Image {img_idx+1} failed to load")
-                                st.caption(f"[View Image]({img_url})")
-                
-                with st.expander("Read Article"):
-                    st.write(article['content'])
-                
-                col1, col2, col3, col4 = st.columns(4)
-                
-                with col1:
-                    if st.button("Publish Draft", key=f"draft_{article_id}", 
-                               disabled=article_id in st.session_state.published,
-                               use_container_width=True):
-                        publisher = WordPressPublisher()
+                        st.caption(f"✓ Will use: {image_options[selected_image_idx]} (860x475px)")
+                else:
+                    st.caption("No images found")
+            
+            with col_img_refresh:
+                st.write("")  # Spacing
+                st.write("")  # Spacing
+                if st.button("🔄 Refresh Images", key=f"refresh_img_{article_id}", use_container_width=True):
+                    image_fetcher = ImageFetcher()
+                    new_images = image_fetcher.fetch_images(article['url'])
+                    st.session_state.processed_articles[idx]['images'] = new_images
+                    st.success(f"Found {len(new_images)} images!")
+                    st.rerun()
+            
+            # Display images
+            if article['images']:
+                st.write("**Available Images:**")
+                img_cols = st.columns(min(3, len(article['images'])))
+                for img_idx, img_url in enumerate(article['images'][:3]):
+                    with img_cols[img_idx]:
+                        try:
+                            response = requests.get(img_url, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
+                            img = Image.open(BytesIO(response.content))
+                            st.image(img, use_container_width=True)
+                            if selected_image and img_url == selected_image:
+                                st.caption(f"**Image {img_idx+1}** ⭐ Selected")
+                            else:
+                                st.caption(f"Image {img_idx+1}")
+                        except Exception as e:
+                            st.warning(f"⚠️ Image {img_idx+1} failed")
+            
+            # Preview content
+            with st.expander("Preview Original Content"):
+                st.write(article['raw_content'][:500] + "...")
+            
+            # Publish button
+            if selected_sites and article_id not in st.session_state.published:
+                if st.button(
+                    f"Publish to {len(selected_sites)} site(s)",
+                    key=f"publish_{article_id}",
+                    type="primary",
+                    use_container_width=True
+                ):
+                    processor = NewsProcessor()
+                    publisher = WordPressPublisher()
+                    
+                    success_count = 0
+                    failed_sites = []
+                    
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    for site_idx, (site_key, site_config) in enumerate(selected_sites):
+                        status_text.text(f"Processing for {site_config['name']}...")
+                        
+                        # Rewrite for this specific site
+                        rewritten_data = processor.rewrite_for_site(article, site_config)
+                        
+                        if not rewritten_data:
+                            failed_sites.append(f"{site_config['name']} (rewrite failed)")
+                            progress_bar.progress((site_idx + 1) / len(selected_sites))
+                            continue
+                        
+                        # Publish
                         result = publisher.publish(
                             site_config,
-                            selected_headline,
-                            article['content'],
+                            rewritten_data['headlines'][0],
+                            rewritten_data['content'],
                             'draft',
                             image_url=selected_image,
-                            tags=article.get('tags', [])
+                            tags=rewritten_data['tags']
                         )
+                        
                         if result['success']:
-                            success_msg = f"Draft created! [Edit]({result['edit_url']})"
-                            if result.get('featured_image_set'):
-                                success_msg += " ✓ Image"
-                            if result.get('tags_set', 0) > 0:
-                                success_msg += f" ✓ {result['tags_set']} tags"
-                            if result.get('internal_link_added'):
-                                success_msg += " ✓ Internal link"
-                            st.success(success_msg)
-                            st.session_state.published.add(article_id)
-                            st.rerun()
+                            success_count += 1
+                            # Add to Supabase
+                            processor.db.add_processed(
+                                article['url'],
+                                rewritten_data['content'],
+                                article['original_title'],
+                                site_key
+                            )
+                            st.success(f"✅ {site_config['name']}: [Edit]({result['edit_url']})")
                         else:
-                            st.error(f"Failed: {result['error']}")
-                
-                with col2:
-                    if st.button("Publish Live", key=f"live_{article_id}", 
-                               disabled=article_id in st.session_state.published,
-                               type="primary",
-                               use_container_width=True):
-                        publisher = WordPressPublisher()
-                        result = publisher.publish(
-                            site_config,
-                            selected_headline,
-                            article['content'],
-                            'publish',
-                            image_url=selected_image,
-                            tags=article.get('tags', [])
-                        )
-                        if result['success']:
-                            success_msg = f"Published! [View]({result['edit_url']})"
-                            if result.get('featured_image_set'):
-                                success_msg += " ✓ Image"
-                            if result.get('tags_set', 0) > 0:
-                                success_msg += f" ✓ {result['tags_set']} tags"
-                            if result.get('internal_link_added'):
-                                success_msg += " ✓ Internal link"
-                            st.success(success_msg)
-                            st.session_state.published.add(article_id)
-                            st.rerun()
-                        else:
-                            st.error(f"Failed: {result['error']}")
-                
-                with col3:
-                    if st.button("Regenerate Headline", key=f"regen_{article_id}",
-                               use_container_width=True):
-                        processor = ContentProcessor()
-                        _, new_headlines = processor.rewrite_article(
-                            article['content'][:1000],
-                            site_config
-                        )
-                        if new_headlines:
-                            st.session_state.processed_articles[site_key][idx]['headlines'] = new_headlines
-                            st.rerun()
-                
-                with col4:
-                    st.link_button("Source", article['url'], use_container_width=True)
-                
-                st.markdown('</div>', unsafe_allow_html=True)
+                            failed_sites.append(f"{site_config['name']}: {result['error']}")
+                            st.error(f"❌ {site_config['name']}: {result['error']}")
+                        
+                        progress_bar.progress((site_idx + 1) / len(selected_sites))
+                    
+                    status_text.empty()
+                    progress_bar.empty()
+                    
+                    if success_count > 0:
+                        st.session_state.published.add(article_id)
+                        st.balloons()
+                        time.sleep(2)
+                        st.rerun()
+                    
+                    if failed_sites:
+                        st.warning(f"Failed: {', '.join(failed_sites)}")
+            
+            st.markdown('</div>', unsafe_allow_html=True)
+            st.markdown("---")
 
 else:
-    st.info("Click 'Fetch & Process Articles' to begin")
+    st.info("Click 'Fetch Articles' to begin")

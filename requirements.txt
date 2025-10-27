@@ -6,3 +6,4 @@ anthropic>=0.18.1
 Pillow>=10.3.0
 html5lib>=1.1
 supabase>=2.0.0
+plotly

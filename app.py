@@ -1423,12 +1423,6 @@ with tab1:
         st.info("Click 'Fetch Articles' to begin")
 
 with tab2:
-    """
-TAB 2 - Keep Google Sheets View, Replace Analytics Dashboard
-Only the Analytics Dashboard tab gets the KPI tables
-"""
-
-with tab2:
     sub_tab1, sub_tab2 = st.tabs(["📋 Google Sheets View", "📈 KPI Dashboard"])
     
     # === KEEP THIS: Google Sheets View ===
@@ -1659,9 +1653,9 @@ with tab2:
         try:
             db = SupabaseDatabase()
             if db.client:
-                # Get all brands with their latest metrics
+                # Get all brands with their latest metrics (last 90 days)
                 query = db.client.table('newsletter_metrics').select('*')
-                query = query.gte('date', (today - timedelta(days=60)).strftime('%Y-%m-%d'))
+                query = query.gte('date', (today - timedelta(days=90)).strftime('%Y-%m-%d'))
                 result = query.execute()
                 
                 if result.data:
@@ -1673,33 +1667,50 @@ with tab2:
                     
                     brand_data = []
                     for brand in sorted(brands):
-                        brand_df = df[df['brand'] == brand]
+                        brand_df = df[df['brand'] == brand].sort_values('date')
                         
-                        # Current list size (latest date)
-                        latest = brand_df[brand_df['date'] == brand_df['date'].max()]
-                        list_size = int(latest['brand_list_size'].iloc[0]) if len(latest) > 0 else 0
+                        if len(brand_df) == 0:
+                            continue
                         
-                        # Week over week growth
-                        this_week_df = brand_df[brand_df['date'] >= week_start]
-                        last_week_df = brand_df[(brand_df['date'] >= prev_week_start) & (brand_df['date'] <= prev_week_end)]
+                        # Current list size (most recent date with data)
+                        latest_record = brand_df.iloc[-1]
+                        list_size = int(latest_record['brand_list_size'])
+                        latest_date = latest_record['date']
                         
-                        this_week_size = int(this_week_df['brand_list_size'].max()) if len(this_week_df) > 0 else 0
-                        last_week_size = int(last_week_df['brand_list_size'].max()) if len(last_week_df) > 0 else 0
-                        week_growth = this_week_size - last_week_size
+                        # Week over week: Compare latest list size to 7 days ago
+                        week_ago_date = latest_date - timedelta(days=7)
+                        week_ago_df = brand_df[brand_df['date'] <= week_ago_date]
                         
-                        # Month over month growth
-                        this_month_df = brand_df[(brand_df['date'] >= month_start) & (brand_df['date'] <= month_end)]
-                        last_month_df = brand_df[(brand_df['date'] >= prev_month_start) & (brand_df['date'] <= prev_month_end)]
+                        if len(week_ago_df) > 0:
+                            week_ago_size = int(week_ago_df.iloc[-1]['brand_list_size'])
+                            week_growth = list_size - week_ago_size
+                            week_growth_pct = (week_growth / week_ago_size * 100) if week_ago_size > 0 else 0
+                        else:
+                            week_growth = 0
+                            week_growth_pct = 0
                         
-                        this_month_size = int(this_month_df['brand_list_size'].max()) if len(this_month_df) > 0 else 0
-                        last_month_size = int(last_month_df['brand_list_size'].max()) if len(last_month_df) > 0 else 0
-                        month_growth = this_month_size - last_month_size
+                        # Month over month: Compare to 30 days ago
+                        month_ago_date = latest_date - timedelta(days=30)
+                        month_ago_df = brand_df[brand_df['date'] <= month_ago_date]
+                        
+                        if len(month_ago_df) > 0:
+                            month_ago_size = int(month_ago_df.iloc[-1]['brand_list_size'])
+                            month_growth = list_size - month_ago_size
+                            month_growth_pct = (month_growth / month_ago_size * 100) if month_ago_size > 0 else 0
+                        else:
+                            month_growth = 0
+                            month_growth_pct = 0
+                        
+                        # Format growth with color indicators
+                        week_color = "🟢" if week_growth > 0 else "🔴" if week_growth < 0 else "⚪"
+                        month_color = "🟢" if month_growth > 0 else "🔴" if month_growth < 0 else "⚪"
                         
                         brand_data.append({
                             'Brand': brand,
                             'Active List Size': f"{list_size:,}",
-                            'Week over Week': f"{week_growth:+,}" if week_growth != 0 else "0",
-                            'Month over Month': f"{month_growth:+,}" if month_growth != 0 else "0"
+                            'Week over Week': f"{week_color} {week_growth:+,} ({week_growth_pct:+.1f}%)",
+                            'Month over Month': f"{month_color} {month_growth:+,} ({month_growth_pct:+.1f}%)",
+                            'Last Updated': latest_date.strftime('%b %d')
                         })
                     
                     # Display as dataframe

@@ -1423,283 +1423,297 @@ with tab1:
         st.info("Click 'Fetch Articles' to begin")
 
 with tab2:
-    st.markdown("## 📊 Newsletter KPI Dashboard")
+    """
+TAB 2 - Keep Google Sheets View, Replace Analytics Dashboard
+Only the Analytics Dashboard tab gets the KPI tables
+"""
+
+with tab2:
+    sub_tab1, sub_tab2 = st.tabs(["📋 Google Sheets View", "📈 KPI Dashboard"])
     
-    # Helper functions
-    def get_metrics_for_period(start_date, end_date, platform=None, brand=None):
-        """Get aggregated metrics for a date range"""
+    # === KEEP THIS: Google Sheets View ===
+    with sub_tab1:
+        show_google_sheets_view()
+    
+    # === REPLACE THIS: Analytics Dashboard with KPI Dashboard ===
+    with sub_tab2:
+        st.markdown("## 📊 Newsletter KPI Dashboard")
+        
+        # Helper functions
+        def get_metrics_for_period(start_date, end_date, platform=None, brand=None):
+            """Get aggregated metrics for a date range"""
+            try:
+                db = SupabaseDatabase()
+                if not db.client:
+                    return None
+                
+                query = db.client.table('newsletter_metrics').select('*')
+                query = query.gte('date', start_date.strftime('%Y-%m-%d')).lte('date', end_date.strftime('%Y-%m-%d'))
+                
+                if platform:
+                    query = query.eq('platform', platform)
+                if brand:
+                    query = query.eq('brand', brand)
+                
+                result = query.execute()
+                
+                if not result.data:
+                    return None
+                
+                df = pd.DataFrame(result.data)
+                
+                return {
+                    'sends': int(df['sends'].sum()),
+                    'delivered': int(df['delivered'].sum()),
+                    'opens': int(df['opens'].sum()),
+                    'unique_opens': int(df['unique_opens'].sum()),
+                    'clicks': int(df['clicks'].sum()),
+                    'unique_clicks': int(df['unique_clicks'].sum()),
+                    'spam_reports': int(df['spam_reports'].sum()),
+                    'list_size': int(df['brand_list_size'].max()) if len(df) > 0 else 0,
+                    'records': len(df)
+                }
+            except Exception as e:
+                st.error(f"Error: {e}")
+                return None
+        
+        def calculate_pct_change(current, previous):
+            """Calculate percentage change"""
+            if previous == 0:
+                return 0.0
+            return round(((current - previous) / previous) * 100, 1)
+        
+        def render_kpi_table(title, daily, prev_daily, weekly, prev_weekly, monthly, prev_monthly):
+            """Render a complete KPI table section"""
+            st.markdown(f"### {title}")
+            
+            # Create the table structure
+            metrics = [
+                ('Sends', 'sends'),
+                ('Delivered', 'delivered'),
+                ('Opened', 'opens'),
+                ('Unique Opens', 'unique_opens'),
+                ('Clicks', 'clicks'),
+                ('Unique Clicks', 'unique_clicks'),
+                ('Spam Complaints', 'spam_reports')
+            ]
+            
+            # Table header
+            cols = st.columns([2.5, 1.5, 1, 1.5, 1, 1.5, 1])
+            with cols[0]:
+                st.markdown("**Metric**")
+            with cols[1]:
+                st.markdown("**Daily**")
+            with cols[2]:
+                st.markdown("**Daily %**")
+            with cols[3]:
+                st.markdown("**Weekly**")
+            with cols[4]:
+                st.markdown("**Weekly %**")
+            with cols[5]:
+                st.markdown("**Current Month**")
+            with cols[6]:
+                st.markdown("**Monthly %**")
+            
+            st.markdown("---")
+            
+            if not daily or not weekly or not monthly:
+                st.info("📊 No data available for this period")
+                return
+            
+            # Render each metric row
+            for label, key in metrics:
+                cols = st.columns([2.5, 1.5, 1, 1.5, 1, 1.5, 1])
+                
+                # Daily values
+                daily_val = daily.get(key, 0)
+                prev_daily_val = prev_daily.get(key, 0) if prev_daily else 0
+                daily_pct = calculate_pct_change(daily_val, prev_daily_val)
+                
+                # Weekly values
+                weekly_val = weekly.get(key, 0)
+                prev_weekly_val = prev_weekly.get(key, 0) if prev_weekly else 0
+                weekly_pct = calculate_pct_change(weekly_val, prev_weekly_val)
+                
+                # Monthly values
+                monthly_val = monthly.get(key, 0)
+                prev_monthly_val = prev_monthly.get(key, 0) if prev_monthly else 0
+                monthly_pct = calculate_pct_change(monthly_val, prev_monthly_val)
+                
+                with cols[0]:
+                    st.markdown(f"**{label}**")
+                with cols[1]:
+                    st.markdown(f"{daily_val:,}")
+                with cols[2]:
+                    color = "🟢" if daily_pct >= 0 else "🔴"
+                    st.markdown(f"{color} {daily_pct:+.1f}%")
+                with cols[3]:
+                    st.markdown(f"{weekly_val:,}")
+                with cols[4]:
+                    color = "🟢" if weekly_pct >= 0 else "🔴"
+                    st.markdown(f"{color} {weekly_pct:+.1f}%")
+                with cols[5]:
+                    st.markdown(f"{monthly_val:,}")
+                with cols[6]:
+                    color = "🟢" if monthly_pct >= 0 else "🔴"
+                    st.markdown(f"{color} {monthly_pct:+.1f}%")
+            
+            st.markdown("---")
+        
+        # Date calculations
+        today = datetime.now().date()
+        yesterday = today - timedelta(days=1)
+        day_before_yesterday = today - timedelta(days=2)
+        
+        # Week calculations (last 7 days vs previous 7 days)
+        week_end = yesterday
+        week_start = week_end - timedelta(days=6)
+        prev_week_end = week_start - timedelta(days=1)
+        prev_week_start = prev_week_end - timedelta(days=6)
+        
+        # Month calculations
+        month_start = today.replace(day=1)
+        month_end = yesterday
+        if month_start.month == 1:
+            prev_month_start = month_start.replace(year=month_start.year - 1, month=12)
+        else:
+            prev_month_start = month_start.replace(month=month_start.month - 1)
+        if prev_month_start.month == 12:
+            prev_month_end = prev_month_start.replace(day=31)
+        else:
+            next_month = prev_month_start.replace(month=prev_month_start.month + 1)
+            prev_month_end = next_month - timedelta(days=1)
+        
+        # Show date ranges
+        with st.expander("📅 Date Ranges", expanded=False):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.markdown("**Daily:**")
+                st.markdown(f"Current: {yesterday.strftime('%b %d, %Y')}")
+                st.markdown(f"Previous: {day_before_yesterday.strftime('%b %d, %Y')}")
+            with col2:
+                st.markdown("**Weekly:**")
+                st.markdown(f"Current: {week_start.strftime('%b %d')} - {week_end.strftime('%b %d')}")
+                st.markdown(f"Previous: {prev_week_start.strftime('%b %d')} - {prev_week_end.strftime('%b %d')}")
+            with col3:
+                st.markdown("**Monthly:**")
+                st.markdown(f"Current: {month_start.strftime('%b %Y')}")
+                st.markdown(f"Previous: {prev_month_start.strftime('%b %Y')}")
+        
+        st.markdown("---")
+        
+        # Fetch all data
+        # TinyEmail
+        tiny_daily = get_metrics_for_period(yesterday, yesterday, platform='tinyemail')
+        tiny_prev_daily = get_metrics_for_period(day_before_yesterday, day_before_yesterday, platform='tinyemail')
+        tiny_weekly = get_metrics_for_period(week_start, week_end, platform='tinyemail')
+        tiny_prev_weekly = get_metrics_for_period(prev_week_start, prev_week_end, platform='tinyemail')
+        tiny_monthly = get_metrics_for_period(month_start, month_end, platform='tinyemail')
+        tiny_prev_monthly = get_metrics_for_period(prev_month_start, prev_month_end, platform='tinyemail')
+        
+        # Beehiiv
+        bee_daily = get_metrics_for_period(yesterday, yesterday, platform='beehiiv')
+        bee_prev_daily = get_metrics_for_period(day_before_yesterday, day_before_yesterday, platform='beehiiv')
+        bee_weekly = get_metrics_for_period(week_start, week_end, platform='beehiiv')
+        bee_prev_weekly = get_metrics_for_period(prev_week_start, prev_week_end, platform='beehiiv')
+        bee_monthly = get_metrics_for_period(month_start, month_end, platform='beehiiv')
+        bee_prev_monthly = get_metrics_for_period(prev_month_start, prev_month_end, platform='beehiiv')
+        
+        # Combined
+        combined_daily = get_metrics_for_period(yesterday, yesterday)
+        combined_prev_daily = get_metrics_for_period(day_before_yesterday, day_before_yesterday)
+        combined_weekly = get_metrics_for_period(week_start, week_end)
+        combined_prev_weekly = get_metrics_for_period(prev_week_start, prev_week_end)
+        combined_monthly = get_metrics_for_period(month_start, month_end)
+        combined_prev_monthly = get_metrics_for_period(prev_month_start, prev_month_end)
+        
+        # === RENDER TABLES ===
+        
+        # Tiny Email Account Wide
+        render_kpi_table(
+            "📧 Tiny Email Account Wide",
+            tiny_daily, tiny_prev_daily,
+            tiny_weekly, tiny_prev_weekly,
+            tiny_monthly, tiny_prev_monthly
+        )
+        
+        # Beehiiv Account Wide
+        render_kpi_table(
+            "🐝 BeeHiiv Account Wide",
+            bee_daily, bee_prev_daily,
+            bee_weekly, bee_prev_weekly,
+            bee_monthly, bee_prev_monthly
+        )
+        
+        # Combined Accounts
+        render_kpi_table(
+            "🌐 Combined Accounts",
+            combined_daily, combined_prev_daily,
+            combined_weekly, combined_prev_weekly,
+            combined_monthly, combined_prev_monthly
+        )
+        
+        # === BRAND GROWTH TABLE ===
+        st.markdown("### 📊 Brand Growth Summary")
+        
         try:
             db = SupabaseDatabase()
-            if not db.client:
-                return None
-            
-            query = db.client.table('newsletter_metrics').select('*')
-            query = query.gte('date', start_date.strftime('%Y-%m-%d')).lte('date', end_date.strftime('%Y-%m-%d'))
-            
-            if platform:
-                query = query.eq('platform', platform)
-            if brand:
-                query = query.eq('brand', brand)
-            
-            result = query.execute()
-            
-            if not result.data:
-                return None
-            
-            df = pd.DataFrame(result.data)
-            
-            return {
-                'sends': int(df['sends'].sum()),
-                'delivered': int(df['delivered'].sum()),
-                'opens': int(df['opens'].sum()),
-                'unique_opens': int(df['unique_opens'].sum()),
-                'clicks': int(df['clicks'].sum()),
-                'unique_clicks': int(df['unique_clicks'].sum()),
-                'spam_reports': int(df['spam_reports'].sum()),
-                'list_size': int(df['brand_list_size'].max()) if len(df) > 0 else 0,
-                'records': len(df)
-            }
-        except Exception as e:
-            st.error(f"Error: {e}")
-            return None
-    
-    def calculate_pct_change(current, previous):
-        """Calculate percentage change"""
-        if previous == 0:
-            return 0.0
-        return round(((current - previous) / previous) * 100, 1)
-    
-    def render_kpi_table(title, daily, prev_daily, weekly, prev_weekly, monthly, prev_monthly):
-        """Render a complete KPI table section"""
-        st.markdown(f"### {title}")
-        
-        # Create the table structure
-        metrics = [
-            ('Sends', 'sends'),
-            ('Delivered', 'delivered'),
-            ('Opened', 'opens'),
-            ('Unique Opens', 'unique_opens'),
-            ('Clicks', 'clicks'),
-            ('Unique Clicks', 'unique_clicks'),
-            ('Spam Complaints', 'spam_reports')
-        ]
-        
-        # Table header
-        cols = st.columns([2.5, 1.5, 1, 1.5, 1, 1.5, 1])
-        with cols[0]:
-            st.markdown("**Metric**")
-        with cols[1]:
-            st.markdown("**Daily**")
-        with cols[2]:
-            st.markdown("**Daily %**")
-        with cols[3]:
-            st.markdown("**Weekly**")
-        with cols[4]:
-            st.markdown("**Weekly %**")
-        with cols[5]:
-            st.markdown("**Current Month**")
-        with cols[6]:
-            st.markdown("**Monthly %**")
-        
-        st.markdown("---")
-        
-        if not daily or not weekly or not monthly:
-            st.info("📊 No data available for this period")
-            return
-        
-        # Render each metric row
-        for label, key in metrics:
-            cols = st.columns([2.5, 1.5, 1, 1.5, 1, 1.5, 1])
-            
-            # Daily values
-            daily_val = daily.get(key, 0)
-            prev_daily_val = prev_daily.get(key, 0) if prev_daily else 0
-            daily_pct = calculate_pct_change(daily_val, prev_daily_val)
-            
-            # Weekly values
-            weekly_val = weekly.get(key, 0)
-            prev_weekly_val = prev_weekly.get(key, 0) if prev_weekly else 0
-            weekly_pct = calculate_pct_change(weekly_val, prev_weekly_val)
-            
-            # Monthly values
-            monthly_val = monthly.get(key, 0)
-            prev_monthly_val = prev_monthly.get(key, 0) if prev_monthly else 0
-            monthly_pct = calculate_pct_change(monthly_val, prev_monthly_val)
-            
-            with cols[0]:
-                st.markdown(f"**{label}**")
-            with cols[1]:
-                st.markdown(f"{daily_val:,}")
-            with cols[2]:
-                color = "🟢" if daily_pct >= 0 else "🔴"
-                st.markdown(f"{color} {daily_pct:+.1f}%")
-            with cols[3]:
-                st.markdown(f"{weekly_val:,}")
-            with cols[4]:
-                color = "🟢" if weekly_pct >= 0 else "🔴"
-                st.markdown(f"{color} {weekly_pct:+.1f}%")
-            with cols[5]:
-                st.markdown(f"{monthly_val:,}")
-            with cols[6]:
-                color = "🟢" if monthly_pct >= 0 else "🔴"
-                st.markdown(f"{color} {monthly_pct:+.1f}%")
-        
-        st.markdown("---")
-    
-    # Date calculations
-    today = datetime.now().date()
-    yesterday = today - timedelta(days=1)
-    day_before_yesterday = today - timedelta(days=2)
-    
-    # Week calculations (last 7 days vs previous 7 days)
-    week_end = yesterday
-    week_start = week_end - timedelta(days=6)
-    prev_week_end = week_start - timedelta(days=1)
-    prev_week_start = prev_week_end - timedelta(days=6)
-    
-    # Month calculations
-    month_start = today.replace(day=1)
-    month_end = yesterday
-    if month_start.month == 1:
-        prev_month_start = month_start.replace(year=month_start.year - 1, month=12)
-    else:
-        prev_month_start = month_start.replace(month=month_start.month - 1)
-    if prev_month_start.month == 12:
-        prev_month_end = prev_month_start.replace(day=31)
-    else:
-        next_month = prev_month_start.replace(month=prev_month_start.month + 1)
-        prev_month_end = next_month - timedelta(days=1)
-    
-    # Show date ranges
-    with st.expander("📅 Date Ranges", expanded=False):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.markdown("**Daily:**")
-            st.markdown(f"Current: {yesterday.strftime('%b %d, %Y')}")
-            st.markdown(f"Previous: {day_before_yesterday.strftime('%b %d, %Y')}")
-        with col2:
-            st.markdown("**Weekly:**")
-            st.markdown(f"Current: {week_start.strftime('%b %d')} - {week_end.strftime('%b %d')}")
-            st.markdown(f"Previous: {prev_week_start.strftime('%b %d')} - {prev_week_end.strftime('%b %d')}")
-        with col3:
-            st.markdown("**Monthly:**")
-            st.markdown(f"Current: {month_start.strftime('%b %Y')}")
-            st.markdown(f"Previous: {prev_month_start.strftime('%b %Y')}")
-    
-    st.markdown("---")
-    
-    # Fetch all data
-    # TinyEmail
-    tiny_daily = get_metrics_for_period(yesterday, yesterday, platform='tinyemail')
-    tiny_prev_daily = get_metrics_for_period(day_before_yesterday, day_before_yesterday, platform='tinyemail')
-    tiny_weekly = get_metrics_for_period(week_start, week_end, platform='tinyemail')
-    tiny_prev_weekly = get_metrics_for_period(prev_week_start, prev_week_end, platform='tinyemail')
-    tiny_monthly = get_metrics_for_period(month_start, month_end, platform='tinyemail')
-    tiny_prev_monthly = get_metrics_for_period(prev_month_start, prev_month_end, platform='tinyemail')
-    
-    # Beehiiv
-    bee_daily = get_metrics_for_period(yesterday, yesterday, platform='beehiiv')
-    bee_prev_daily = get_metrics_for_period(day_before_yesterday, day_before_yesterday, platform='beehiiv')
-    bee_weekly = get_metrics_for_period(week_start, week_end, platform='beehiiv')
-    bee_prev_weekly = get_metrics_for_period(prev_week_start, prev_week_end, platform='beehiiv')
-    bee_monthly = get_metrics_for_period(month_start, month_end, platform='beehiiv')
-    bee_prev_monthly = get_metrics_for_period(prev_month_start, prev_month_end, platform='beehiiv')
-    
-    # Combined
-    combined_daily = get_metrics_for_period(yesterday, yesterday)
-    combined_prev_daily = get_metrics_for_period(day_before_yesterday, day_before_yesterday)
-    combined_weekly = get_metrics_for_period(week_start, week_end)
-    combined_prev_weekly = get_metrics_for_period(prev_week_start, prev_week_end)
-    combined_monthly = get_metrics_for_period(month_start, month_end)
-    combined_prev_monthly = get_metrics_for_period(prev_month_start, prev_month_end)
-    
-    # === RENDER TABLES ===
-    
-    # Tiny Email Account Wide
-    render_kpi_table(
-        "📧 Tiny Email Account Wide",
-        tiny_daily, tiny_prev_daily,
-        tiny_weekly, tiny_prev_weekly,
-        tiny_monthly, tiny_prev_monthly
-    )
-    
-    # Beehiiv Account Wide
-    render_kpi_table(
-        "🐝 BeeHiiv Account Wide",
-        bee_daily, bee_prev_daily,
-        bee_weekly, bee_prev_weekly,
-        bee_monthly, bee_prev_monthly
-    )
-    
-    # Combined Accounts
-    render_kpi_table(
-        "🌐 Combined Accounts",
-        combined_daily, combined_prev_daily,
-        combined_weekly, combined_prev_weekly,
-        combined_monthly, combined_prev_monthly
-    )
-    
-    # === BRAND GROWTH TABLE ===
-    st.markdown("### 📊 Brand Growth Summary")
-    
-    try:
-        db = SupabaseDatabase()
-        if db.client:
-            # Get all brands with their latest metrics
-            query = db.client.table('newsletter_metrics').select('*')
-            query = query.gte('date', (today - timedelta(days=60)).strftime('%Y-%m-%d'))
-            result = query.execute()
-            
-            if result.data:
-                df = pd.DataFrame(result.data)
-                df['date'] = pd.to_datetime(df['date']).dt.date
+            if db.client:
+                # Get all brands with their latest metrics
+                query = db.client.table('newsletter_metrics').select('*')
+                query = query.gte('date', (today - timedelta(days=60)).strftime('%Y-%m-%d'))
+                result = query.execute()
                 
-                # Get unique brands
-                brands = df['brand'].unique()
-                
-                brand_data = []
-                for brand in sorted(brands):
-                    brand_df = df[df['brand'] == brand]
+                if result.data:
+                    df = pd.DataFrame(result.data)
+                    df['date'] = pd.to_datetime(df['date']).dt.date
                     
-                    # Current list size (latest date)
-                    latest = brand_df[brand_df['date'] == brand_df['date'].max()]
-                    list_size = int(latest['brand_list_size'].iloc[0]) if len(latest) > 0 else 0
+                    # Get unique brands
+                    brands = df['brand'].unique()
                     
-                    # Week over week growth
-                    this_week_df = brand_df[brand_df['date'] >= week_start]
-                    last_week_df = brand_df[(brand_df['date'] >= prev_week_start) & (brand_df['date'] <= prev_week_end)]
+                    brand_data = []
+                    for brand in sorted(brands):
+                        brand_df = df[df['brand'] == brand]
+                        
+                        # Current list size (latest date)
+                        latest = brand_df[brand_df['date'] == brand_df['date'].max()]
+                        list_size = int(latest['brand_list_size'].iloc[0]) if len(latest) > 0 else 0
+                        
+                        # Week over week growth
+                        this_week_df = brand_df[brand_df['date'] >= week_start]
+                        last_week_df = brand_df[(brand_df['date'] >= prev_week_start) & (brand_df['date'] <= prev_week_end)]
+                        
+                        this_week_size = int(this_week_df['brand_list_size'].max()) if len(this_week_df) > 0 else 0
+                        last_week_size = int(last_week_df['brand_list_size'].max()) if len(last_week_df) > 0 else 0
+                        week_growth = this_week_size - last_week_size
+                        
+                        # Month over month growth
+                        this_month_df = brand_df[(brand_df['date'] >= month_start) & (brand_df['date'] <= month_end)]
+                        last_month_df = brand_df[(brand_df['date'] >= prev_month_start) & (brand_df['date'] <= prev_month_end)]
+                        
+                        this_month_size = int(this_month_df['brand_list_size'].max()) if len(this_month_df) > 0 else 0
+                        last_month_size = int(last_month_df['brand_list_size'].max()) if len(last_month_df) > 0 else 0
+                        month_growth = this_month_size - last_month_size
+                        
+                        brand_data.append({
+                            'Brand': brand,
+                            'Active List Size': f"{list_size:,}",
+                            'Week over Week': f"{week_growth:+,}" if week_growth != 0 else "0",
+                            'Month over Month': f"{month_growth:+,}" if month_growth != 0 else "0"
+                        })
                     
-                    this_week_size = int(this_week_df['brand_list_size'].max()) if len(this_week_df) > 0 else 0
-                    last_week_size = int(last_week_df['brand_list_size'].max()) if len(last_week_df) > 0 else 0
-                    week_growth = this_week_size - last_week_size
-                    
-                    # Month over month growth
-                    this_month_df = brand_df[(brand_df['date'] >= month_start) & (brand_df['date'] <= month_end)]
-                    last_month_df = brand_df[(brand_df['date'] >= prev_month_start) & (brand_df['date'] <= prev_month_end)]
-                    
-                    this_month_size = int(this_month_df['brand_list_size'].max()) if len(this_month_df) > 0 else 0
-                    last_month_size = int(last_month_df['brand_list_size'].max()) if len(last_month_df) > 0 else 0
-                    month_growth = this_month_size - last_month_size
-                    
-                    brand_data.append({
-                        'Brand': brand,
-                        'Active List Size': f"{list_size:,}",
-                        'Week over Week': f"{week_growth:+,}" if week_growth != 0 else "0",
-                        'Month over Month': f"{month_growth:+,}" if month_growth != 0 else "0"
-                    })
-                
-                # Display as dataframe
-                if brand_data:
-                    growth_df = pd.DataFrame(brand_data)
-                    st.dataframe(growth_df, use_container_width=True, hide_index=True)
+                    # Display as dataframe
+                    if brand_data:
+                        growth_df = pd.DataFrame(brand_data)
+                        st.dataframe(growth_df, use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No brand growth data available")
                 else:
-                    st.info("No brand growth data available")
+                    st.info("No brand data available")
             else:
-                st.info("No brand data available")
-        else:
-            st.warning("Database connection not available")
-    except Exception as e:
-        st.error(f"Error loading brand growth data: {e}")
+                st.warning("Database connection not available")
+        except Exception as e:
+            st.error(f"Error loading brand growth data: {e}")
 
 with tab3:
     st.markdown("## ⚙️ Data Management")

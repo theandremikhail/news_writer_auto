@@ -1431,11 +1431,15 @@ with tab2:
     
     # === REPLACE THIS: Analytics Dashboard with KPI Dashboard ===
     with sub_tab2:
+        # ============= FIXED KPI DASHBOARD SECTION =============
+        # Replace the entire "📊 Newsletter KPI Dashboard" section (in tab2, sub_tab2)
+        # Starting around line 1800
+        
         st.markdown("## 📊 Newsletter KPI Dashboard")
         
         # Helper functions
         def get_metrics_for_period(start_date, end_date, platform=None, brand=None):
-            """Get aggregated metrics for a date range"""
+            """Get aggregated metrics for a date range - FIXED: Calculates delivered count from percentage"""
             try:
                 db = SupabaseDatabase()
                 if not db.client:
@@ -1456,9 +1460,12 @@ with tab2:
                 
                 df = pd.DataFrame(result.data)
                 
+                # ✅ FIX: Calculate actual delivered count from percentage
+                df['delivered_count'] = (df['sends'] * df['delivered'] / 100).fillna(0).astype(int)
+                
                 return {
                     'sends': int(df['sends'].sum()),
-                    'delivered': int(df['delivered'].sum()),
+                    'delivered': int(df['delivered_count'].sum()),  # ← Use calculated count
                     'opens': int(df['opens'].sum()),
                     'unique_opens': int(df['unique_opens'].sum()),
                     'clicks': int(df['clicks'].sum()),
@@ -1596,22 +1603,22 @@ with tab2:
         
         st.markdown("---")
         
-        # Fetch all data
-        # TinyEmail
-        tiny_daily = get_metrics_for_period(yesterday, yesterday, platform='tinyemail')
-        tiny_prev_daily = get_metrics_for_period(day_before_yesterday, day_before_yesterday, platform='tinyemail')
-        tiny_weekly = get_metrics_for_period(week_start, week_end, platform='tinyemail')
-        tiny_prev_weekly = get_metrics_for_period(prev_week_start, prev_week_end, platform='tinyemail')
-        tiny_monthly = get_metrics_for_period(month_start, month_end, platform='tinyemail')
-        tiny_prev_monthly = get_metrics_for_period(prev_month_start, prev_month_end, platform='tinyemail')
+        # ✅ FIX: Changed all platform filters from lowercase to proper case
+        # Fetch all data - TinyEmail
+        tiny_daily = get_metrics_for_period(yesterday, yesterday, platform='TinyEmail')
+        tiny_prev_daily = get_metrics_for_period(day_before_yesterday, day_before_yesterday, platform='TinyEmail')
+        tiny_weekly = get_metrics_for_period(week_start, week_end, platform='TinyEmail')
+        tiny_prev_weekly = get_metrics_for_period(prev_week_start, prev_week_end, platform='TinyEmail')
+        tiny_monthly = get_metrics_for_period(month_start, month_end, platform='TinyEmail')
+        tiny_prev_monthly = get_metrics_for_period(prev_month_start, prev_month_end, platform='TinyEmail')
         
         # Beehiiv
-        bee_daily = get_metrics_for_period(yesterday, yesterday, platform='beehiiv')
-        bee_prev_daily = get_metrics_for_period(day_before_yesterday, day_before_yesterday, platform='beehiiv')
-        bee_weekly = get_metrics_for_period(week_start, week_end, platform='beehiiv')
-        bee_prev_weekly = get_metrics_for_period(prev_week_start, prev_week_end, platform='beehiiv')
-        bee_monthly = get_metrics_for_period(month_start, month_end, platform='beehiiv')
-        bee_prev_monthly = get_metrics_for_period(prev_month_start, prev_month_end, platform='beehiiv')
+        bee_daily = get_metrics_for_period(yesterday, yesterday, platform='Beehiiv')
+        bee_prev_daily = get_metrics_for_period(day_before_yesterday, day_before_yesterday, platform='Beehiiv')
+        bee_weekly = get_metrics_for_period(week_start, week_end, platform='Beehiiv')
+        bee_prev_weekly = get_metrics_for_period(prev_week_start, prev_week_end, platform='Beehiiv')
+        bee_monthly = get_metrics_for_period(month_start, month_end, platform='Beehiiv')
+        bee_prev_monthly = get_metrics_for_period(prev_month_start, prev_month_end, platform='Beehiiv')
         
         # Combined
         combined_daily = get_metrics_for_period(yesterday, yesterday)

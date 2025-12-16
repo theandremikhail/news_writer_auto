@@ -1423,7 +1423,7 @@ with tab1:
         st.info("Click 'Fetch Articles' to begin")
 
 with tab2:
-    sub_tab1, sub_tab2 = st.tabs(["Google Sheets View", "KPI Dashboard"])
+    sub_tab1, sub_tab2, sub_tab3 = st.tabs(["Google Sheets View", "KPI Dashboard", "Summary"])
 
     with sub_tab1:
         show_google_sheets_view()
@@ -1839,16 +1839,172 @@ with tab2:
                 with cols[3]:
                     st.markdown(change_display)
 
+    with sub_tab3:
+        st.markdown("## Summary")
+
+        # ============= HELPER FUNCTIONS FOR SUMMARY =============
+        def get_summary_metrics(start_date, end_date, filter_type="Overall", filter_value=None):
+            """Get aggregated metrics for summary table"""
+            try:
+                db = SupabaseDatabase()
+                if not db.client:
+                    return None
+
+                query = db.client.table('newsletter_metrics').select('*')
+                query = query.gte('date', start_date.strftime('%Y-%m-%d')).lte('date', end_date.strftime('%Y-%m-%d'))
+
+                result = query.execute()
+
+                if not result.data:
+                    return None
+
+                df = pd.DataFrame(result.data)
+
+                # Apply filter based on selection
+                if filter_type == "Tiny Email account wide":
+                    df = df[df['platform'] == 'tinyemail']
+                elif filter_type == "Beehiiv Account wide":
+                    df = df[df['platform'] == 'beehiiv']
+                elif filter_type == "Brand" and filter_value:
+                    df = df[df['brand'] == filter_value]
+
+                if df.empty:
+                    return None
+
+                return {
+                    'sends': int(df['sends'].sum()),
+                    'delivered': int((df['sends'] * df['delivered'] / 100).sum()),
+                    'opens': int(df['opens'].sum()),
+                    'unique_opens': int(df['unique_opens'].sum()),
+                    'clicks': int(df['clicks'].sum()),
+                    'unique_clicks': int(df['unique_clicks'].sum()),
+                    'spam_reports': int(df['spam_reports'].sum())
+                }
+            except Exception as e:
+                st.error(f"Error fetching summary metrics: {e}")
+                return None
+
+        def calc_pct_change(current, previous):
+            """Calculate percentage change"""
+            if previous == 0 or previous is None:
+                return 0.0
+            return round(((current - previous) / previous) * 100, 1)
+
+        # Get available brands for dropdown
+        summary_brands = get_available_brands()
+
+        # Dropdown filter
+        st.markdown("### Select Data View")
+        filter_options = ["Overall", "Tiny Email account wide", "Beehiiv Account wide"] + summary_brands
+        selected_filter = st.selectbox(
+            "Select view",
+            filter_options,
+            key="summary_filter"
+        )
+
+        # Determine filter type and value
+        if selected_filter == "Overall":
+            filter_type = "Overall"
+            filter_value = None
+        elif selected_filter == "Tiny Email account wide":
+            filter_type = "Tiny Email account wide"
+            filter_value = None
+        elif selected_filter == "Beehiiv Account wide":
+            filter_type = "Beehiiv Account wide"
+            filter_value = None
+        else:
+            filter_type = "Brand"
+            filter_value = selected_filter
+
         st.markdown("---")
 
-        # ============= BRAND GROWTH SUMMARY =============
-        st.markdown("### Brand Growth Summary")
+        # Calculate date ranges
+        today = datetime.now().date()
+
+        # Daily: yesterday vs day before yesterday
+        daily_current_start = daily_current_end = today - timedelta(days=1)
+        daily_previous_start = daily_previous_end = today - timedelta(days=2)
+
+        # Weekly: last 7 days vs previous 7 days
+        weekly_current_end = today - timedelta(days=1)
+        weekly_current_start = weekly_current_end - timedelta(days=6)
+        weekly_previous_end = weekly_current_start - timedelta(days=1)
+        weekly_previous_start = weekly_previous_end - timedelta(days=6)
+
+        # Monthly: current month vs previous month
+        current_month_start = today.replace(day=1)
+        if today.month == 1:
+            previous_month_start = today.replace(year=today.year - 1, month=12, day=1)
+        else:
+            previous_month_start = today.replace(month=today.month - 1, day=1)
+        previous_month_end = current_month_start - timedelta(days=1)
+        current_month_end = today - timedelta(days=1)
+
+        # Fetch metrics for each period
+        daily_current = get_summary_metrics(daily_current_start, daily_current_end, filter_type, filter_value)
+        daily_previous = get_summary_metrics(daily_previous_start, daily_previous_end, filter_type, filter_value)
+
+        weekly_current = get_summary_metrics(weekly_current_start, weekly_current_end, filter_type, filter_value)
+        weekly_previous = get_summary_metrics(weekly_previous_start, weekly_previous_end, filter_type, filter_value)
+
+        monthly_current = get_summary_metrics(current_month_start, current_month_end, filter_type, filter_value)
+        monthly_previous = get_summary_metrics(previous_month_start, previous_month_end, filter_type, filter_value)
+
+        # ============= TABLE 1: SUMMARY METRICS =============
+        st.markdown("### Metrics Comparison")
+
+        metrics_list = [
+            ('Sends', 'sends'),
+            ('Delivered', 'delivered'),
+            ('Opened', 'opens'),
+            ('Unique Opens', 'unique_opens'),
+            ('Clicks', 'clicks'),
+            ('Unique Clicks', 'unique_clicks'),
+            ('Spam Complaints', 'spam_reports')
+        ]
+
+        # Build table data
+        table_data = []
+        for label, key in metrics_list:
+            daily_val = daily_current.get(key, 0) if daily_current else 0
+            daily_prev = daily_previous.get(key, 0) if daily_previous else 0
+            daily_pct = calc_pct_change(daily_val, daily_prev)
+
+            weekly_val = weekly_current.get(key, 0) if weekly_current else 0
+            weekly_prev = weekly_previous.get(key, 0) if weekly_previous else 0
+            weekly_pct = calc_pct_change(weekly_val, weekly_prev)
+
+            monthly_val = monthly_current.get(key, 0) if monthly_current else 0
+            monthly_prev = monthly_previous.get(key, 0) if monthly_previous else 0
+            monthly_pct = calc_pct_change(monthly_val, monthly_prev)
+
+            table_data.append({
+                'Metric': label,
+                'Daily': f"{daily_val:,}",
+                'Daily %': f"{daily_pct:+.1f}%",
+                'Weekly': f"{weekly_val:,}",
+                'Weekly %': f"{weekly_pct:+.1f}%",
+                'Current Month': f"{monthly_val:,}",
+                'Monthly %': f"{monthly_pct:+.1f}%"
+            })
+
+        summary_df = pd.DataFrame(table_data)
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+        st.caption(f"Daily: {daily_current_start.strftime('%b %d')} vs {daily_previous_start.strftime('%b %d')} | Weekly: {weekly_current_start.strftime('%b %d')}-{weekly_current_end.strftime('%b %d')} vs {weekly_previous_start.strftime('%b %d')}-{weekly_previous_end.strftime('%b %d')} | Monthly: {current_month_start.strftime('%B')} vs {previous_month_start.strftime('%B')}")
+
+        st.markdown("---")
+
+        # ============= TABLE 2: BRAND GROWTH =============
+        st.markdown("### Brand Growth")
 
         try:
             db = SupabaseDatabase()
             if db.client:
-                query = db.client.table('newsletter_metrics').select('*')
-                query = query.gte('date', (today - timedelta(days=90)).strftime('%Y-%m-%d'))
+                # Get data for the last 60 days to calculate growth
+                sixty_days_ago = today - timedelta(days=60)
+                query = db.client.table('newsletter_metrics').select('date, brand, brand_list_size')
+                query = query.gte('date', sixty_days_ago.strftime('%Y-%m-%d'))
                 result = query.execute()
 
                 if result.data:
@@ -1856,55 +2012,53 @@ with tab2:
                     df['date'] = pd.to_datetime(df['date']).dt.date
 
                     brands = df['brand'].unique()
+                    brand_growth_data = []
 
-                    brand_data = []
                     for brand in sorted(brands):
                         brand_df = df[df['brand'] == brand].sort_values('date')
 
                         if len(brand_df) == 0:
                             continue
 
+                        # Get latest list size
                         latest_record = brand_df.iloc[-1]
-                        list_size = int(latest_record['brand_list_size'])
+                        current_list_size = int(latest_record['brand_list_size'])
                         latest_date = latest_record['date']
 
+                        # Week over week: compare to 7 days ago
                         week_ago_date = latest_date - timedelta(days=7)
-                        week_ago_df = brand_df[brand_df['date'] <= week_ago_date]
+                        week_ago_records = brand_df[brand_df['date'] <= week_ago_date]
 
-                        if len(week_ago_df) > 0:
-                            week_ago_size = int(week_ago_df.iloc[-1]['brand_list_size'])
-                            week_growth = list_size - week_ago_size
-                            week_growth_pct = (week_growth / week_ago_size * 100) if week_ago_size > 0 else 0
+                        if len(week_ago_records) > 0:
+                            week_ago_size = int(week_ago_records.iloc[-1]['brand_list_size'])
+                            wow_change = current_list_size - week_ago_size
                         else:
-                            week_growth = 0
-                            week_growth_pct = 0
+                            wow_change = 0
 
+                        # Month over month: compare to 30 days ago
                         month_ago_date = latest_date - timedelta(days=30)
-                        month_ago_df = brand_df[brand_df['date'] <= month_ago_date]
+                        month_ago_records = brand_df[brand_df['date'] <= month_ago_date]
 
-                        if len(month_ago_df) > 0:
-                            month_ago_size = int(month_ago_df.iloc[-1]['brand_list_size'])
-                            month_growth = list_size - month_ago_size
-                            month_growth_pct = (month_growth / month_ago_size * 100) if month_ago_size > 0 else 0
+                        if len(month_ago_records) > 0:
+                            month_ago_size = int(month_ago_records.iloc[-1]['brand_list_size'])
+                            mom_change = current_list_size - month_ago_size
                         else:
-                            month_growth = 0
-                            month_growth_pct = 0
+                            mom_change = 0
 
-                        brand_data.append({
+                        brand_growth_data.append({
                             'Brand': brand,
-                            'Active List Size': f"{list_size:,}",
-                            'Week over Week': f"{week_growth:+,} ({week_growth_pct:+.1f}%)",
-                            'Month over Month': f"{month_growth:+,} ({month_growth_pct:+.1f}%)",
-                            'Last Updated': latest_date.strftime('%b %d')
+                            'Active List Size': f"{current_list_size:,}",
+                            'Week over Week Growth/Loss': f"{wow_change:+,}",
+                            'Month over Month': f"{mom_change:+,}"
                         })
 
-                    if brand_data:
-                        growth_df = pd.DataFrame(brand_data)
+                    if brand_growth_data:
+                        growth_df = pd.DataFrame(brand_growth_data)
                         st.dataframe(growth_df, use_container_width=True, hide_index=True)
                     else:
                         st.info("No brand growth data available")
                 else:
-                    st.info("No brand data available")
+                    st.info("No data available for brand growth calculation")
             else:
                 st.warning("Database connection not available")
         except Exception as e:

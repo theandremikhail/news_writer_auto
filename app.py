@@ -897,7 +897,7 @@ def show_google_sheets_view():
     with col1:
         days = st.selectbox("Date Range", [7, 14, 30, 60, 90], index=2, key="sheets_days")
     with col2:
-        platform_filter = st.selectbox("Platform", ["All", "tinyemail", "beehiiv"], key="sheets_platform")
+        platform_filter = st.selectbox("Platform", ["All", "TinyEmail", "Beehiiv"], key="sheets_platform")
     with col3:
         brands = db.get_brand_list()
         brand_names = ["All"] + [b['brand_name'] for b in brands]
@@ -1862,9 +1862,9 @@ with tab2:
 
                 # Apply filter based on selection
                 if filter_type == "Tiny Email account wide":
-                    df = df[df['platform'] == 'tinyemail']
+                    df = df[df['platform'] == 'TinyEmail']
                 elif filter_type == "Beehiiv Account wide":
-                    df = df[df['platform'] == 'beehiiv']
+                    df = df[df['platform'] == 'Beehiiv']
                 elif filter_type == "Brand" and filter_value:
                     df = df[df['brand'] == filter_value]
 
@@ -2095,7 +2095,7 @@ with tab3:
     if st.button("Add Test Data", type="primary", use_container_width=True):
         db = SupabaseDatabase()
 
-        platform = 'beehiiv' if 'Americans Daily Digest' in test_brand else 'tinyemail'
+        platform = 'Beehiiv' if 'Americans Daily Digest' in test_brand else 'TinyEmail'
         campaign_type = None
         if 'AM' in test_brand:
             campaign_type = 'AM'
@@ -2159,7 +2159,7 @@ with tab3:
                 db = SupabaseDatabase()
 
                 for _, row in import_df.iterrows():
-                    platform = 'beehiiv' if 'Americans Daily Digest' in row['Brand'] else 'tinyemail'
+                    platform = 'Beehiiv' if 'Americans Daily Digest' in row['Brand'] else 'TinyEmail'
                     campaign_type = None
                     if 'AM' in row['Brand']:
                         campaign_type = 'AM'

@@ -327,6 +327,17 @@ class NewsFetcher:
 class ContentProcessor:
     def __init__(self):
         self.client = anthropic.Anthropic(api_key=ClickMovementConfig.ANTHROPIC_KEY) if ClickMovementConfig.ANTHROPIC_KEY else None
+        self.new_prompt_template = self._load_new_prompt_template()
+
+    def _load_new_prompt_template(self) -> str:
+        """Load the new prompt template from prompt.md"""
+        try:
+            import os
+            prompt_path = os.path.join(os.path.dirname(__file__), 'prompt.md')
+            with open(prompt_path, 'r') as f:
+                return f.read()
+        except Exception as e:
+            return ""
 
     def scrape_article(self, url: str) -> str:
         try:
@@ -460,6 +471,117 @@ ARTICLE:
             return article, headlines[:3]
         except Exception as e:
             st.error(f"Rewrite error: {str(e)}")
+            return "", []
+
+    def rewrite_article_new_prompt(self, content: str, original_title: str) -> Tuple[str, List[str]]:
+        """Rewrite article using the enhanced prompt.md template for American Conservatives"""
+        if not self.client or not content or not self.new_prompt_template:
+            return "", []
+
+        # Build the prompt using the template from prompt.md
+        # Replace the example article in the template with the actual content
+        prompt = f"""# ROLE
+You're a U.S.–based political journalist known for writing with conviction — every story carries a clear stance and unmistakably human perspective. Your work is shaped by Republican conservative values: individual liberty, limited government, free-market capitalism, traditional social principles, and a strong national defense. You excel at blending emotional nuance with cultural context, crafting commentary that feels both authentic and relevant — the kind of writing that connects on instinct, not just ideology.
+
+# GOAL
+You will now write an article based on the following news source:
+
+{original_title}
+
+{content[:3500]}
+
+NUMBER OF WORDS: 500
+
+Your content should be convincingly human-like, engaging, and compelling. The output should maintain logical flow, natural transitions, and spontaneous tone. Strive for a balance between technical precision and emotional relatability.
+
+# SIGNATURE WRITING STYLE
+- Eloquent Precision — You write like someone who's mastered their craft. You choose words with weight.
+- Blunt Truths — You don't sugarcoat. You say what others avoid, but in complete sentences.
+- Controlled Impatience — You sound like someone allergic to fluff and inefficiency. You're direct because you value progress.
+- Rebellious Authority — You're not anti-expertise — you are the expert who's tired of experts playing safe.
+
+# REQUIREMENTS
+- Try to maintain a Flesch Reading Ease score of around 80
+- Use a conversational, engaging tone
+- Do not use em dashes
+- Add natural digressions about related topics that matter
+- Mix professional jargon or work terms with casual explanations
+- Mix in subtle emotional cues and rhetorical questions
+- Use contractions, idioms, and colloquialisms to create an informal, engaging tone
+- Vary Sentence Length and Structure. Mix short, impactful sentences with longer, more complex ones.
+- Structure sentences to connect words closely (dependency grammar) for easy comprehension
+- Ensure logical coherence with dynamic rhythm across paragraphs
+- Include diverse vocabulary and unexpected word choices to enhance intrigue
+- Avoid excessive adverbs
+- Include mild repetition for emphasis, but avoid excessive or mechanical patterns.
+- Use rhetorical or playful subheadings that mimic a natural conversational tone
+- Transition between sections with connecting phrases instead of treating them as discrete parts
+
+# CONTENT ENHANCEMENT GUIDELINES
+- Introduce rhetorical questions, emotional cues, and casual phrases like 'You know what?' where they enhance relatability or flow.
+- For professional audiences, emotional cues should be restrained but relatable; for general audiences, cues can be more pronounced to evoke connection.
+- Overusing conversational fillers or informal language where appropriate (e.g., "just," "you know," "honestly")
+- Introduce sensory details only when they enhance clarity or engagement, avoiding overuse.
+- Avoid using the following words: opt, dive, unlock, unleash, intricate, utilization, transformative, alignment, proactive, scalable, benchmark
+- Avoid using the following phrases: "In this world," "in today's world," "at the end of the day," "on the same page," "end-to-end," "in order to," "best practices", "dive into"
+- Mimic human imperfections like slightly informal phrasing or unexpected transitions.
+- Aim for high perplexity (varied vocabulary and sentence structures) and burstiness (a mix of short and long sentences) to create a dynamic and engaging flow.
+
+# STRUCTURAL ELEMENTS
+- Mix paragraph lengths (1 to 7 sentences)
+- Use bulleted lists sparingly and naturally
+- Include conversational subheadings
+- Ensure logical coherence with dynamic rhythm across paragraphs
+- Use varied punctuation naturally (semicolons, parentheses)
+- Mix formal and casual language naturally
+- Use a mix of active and passive voice, but lean towards active
+
+# OUTPUT FORMAT
+Generate 3 headline options and the rewritten article.
+
+HEADLINE REQUIREMENTS:
+- Write natural, straightforward headlines
+- NO colons or "Title: Subtitle" format
+- NO "EXCLUSIVE:" or "BREAKING:" prefixes
+- Just clear, direct headlines
+
+Format your response EXACTLY like this:
+HEADLINES:
+1. [headline]
+2. [headline]
+3. [headline]
+
+ARTICLE:
+[rewritten content]
+"""
+
+        try:
+            response = self.client.messages.create(
+                model="claude-sonnet-4-5-20250929",
+                max_tokens=3000,
+                temperature=0.8,
+                messages=[{"role": "user", "content": prompt}]
+            )
+
+            text = response.content[0].text
+
+            headlines = []
+            article = ""
+
+            if "HEADLINES:" in text and "ARTICLE:" in text:
+                parts = text.split("ARTICLE:")
+                headline_section = parts[0].replace("HEADLINES:", "").strip()
+                article = parts[1].strip()
+
+                for line in headline_section.split('\n'):
+                    line = re.sub(r'^\d+\.\s*', '', line).strip()
+                    line = line.strip('"').strip("'")
+                    if line and len(line) > 10:
+                        headlines.append(line)
+
+            return article, headlines[:3]
+        except Exception as e:
+            st.error(f"New prompt rewrite error: {str(e)}")
             return "", []
 
 # ============= IMAGE FETCHER =============
@@ -1047,6 +1169,8 @@ if 'published' not in st.session_state:
     st.session_state.published = set()
 if 'article_rewrites' not in st.session_state:
     st.session_state.article_rewrites = {}
+if 'use_new_prompt' not in st.session_state:
+    st.session_state.use_new_prompt = False
 
 st.markdown("""
 <style>
@@ -1109,12 +1233,18 @@ with tab1:
         """)
 
     # Controls
-    col1, col2, col3, col4 = st.columns([1.5, 1.5, 1.5, 1])
+    col1, col2, col3, col4, col5 = st.columns([1.2, 1, 1.2, 1.2, 0.8])
 
     with col1:
         num_articles = st.number_input("Number of Articles", min_value=10, max_value=50, value=40, step=5)
 
     with col2:
+        st.write("")  # Spacer for alignment
+        use_new_prompt = st.toggle("New Prompt", value=st.session_state.use_new_prompt,
+                                   help="Use enhanced prompt from prompt.md for American Conservatives")
+        st.session_state.use_new_prompt = use_new_prompt
+
+    with col3:
         if st.button("Fetch Articles", type="primary", use_container_width=True):
             processor = NewsProcessor()
 
@@ -1125,7 +1255,7 @@ with tab1:
                 st.success(f"Fetched {len(articles)} articles!")
                 st.rerun()
 
-    with col3:
+    with col4:
         if st.button("Test Connections", use_container_width=True):
             publisher = WordPressPublisher()
             for site_key, site_config in ClickMovementConfig.WORDPRESS_SITES.items():
@@ -1135,7 +1265,7 @@ with tab1:
                 else:
                     st.error(f"FAIL {site_config['name']}: {result['error']}")
 
-    with col4:
+    with col5:
         if st.button("Clear All", use_container_width=True):
             st.session_state.processed_articles = []
             st.session_state.published = set()
@@ -1195,12 +1325,22 @@ with tab1:
 
                             if site_key not in st.session_state.article_rewrites[idx]:
                                 # Rewrite in this site's style
-                                with st.spinner(f"Rewriting in {site_config['writer_style']} style..."):
+                                # Use new prompt for American Conservatives if toggle is enabled
+                                use_new = st.session_state.use_new_prompt and site_key == 'american_conservatives'
+                                style_label = "New Prompt" if use_new else site_config['writer_style']
+
+                                with st.spinner(f"Rewriting in {style_label} style..."):
                                     processor = ContentProcessor()
-                                    content, headlines = processor.rewrite_article(
-                                        article['raw_content'],
-                                        site_config
-                                    )
+                                    if use_new:
+                                        content, headlines = processor.rewrite_article_new_prompt(
+                                            article['raw_content'],
+                                            article['original_title']
+                                        )
+                                    else:
+                                        content, headlines = processor.rewrite_article(
+                                            article['raw_content'],
+                                            site_config
+                                        )
 
                                     if content and headlines:
                                         st.session_state.article_rewrites[idx][site_key] = {
@@ -1212,7 +1352,7 @@ with tab1:
                                                 site_config
                                             )
                                         }
-                                        st.success(f"OK {site_config['writer_style']} version ready")
+                                        st.success(f"OK {style_label} version ready")
                                         st.rerun()
                             else:
                                 st.caption(f"OK {site_config['writer_style']} style")
